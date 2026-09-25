@@ -150,14 +150,20 @@ async fn full_flow() {
     );
     engine.ensure_treasury_hotkey().await.unwrap(); // idempotent
 
-    let req = engine.create_payment(CreatePayment::default()).await.unwrap();
+    let req = engine
+        .create_payment(CreatePayment::default())
+        .await
+        .unwrap();
     println!("payment request: {}", serde_json::to_string(&req).unwrap());
     assert_eq!(req.min_alpha, RAO_PER_TAO);
     let deposit = keys::parse_ss58(&req.address).unwrap();
 
     // Below the minimum: stays pending.
     engine.tick().await.unwrap();
-    assert_eq!(engine.status(&req.id).await.unwrap().state, PaymentState::Pending);
+    assert_eq!(
+        engine.status(&req.id).await.unwrap().state,
+        PaymentState::Pending
+    );
 
     let tre = id(&treasury);
     let tre_tao_0 = chain.free_balance(&tre).await.unwrap();
@@ -288,7 +294,10 @@ async fn full_flow() {
     // --- crash after broadcast: the fee transfer is on chain but the process died before
     // recording it. On restart the journal entry is resolved from chain state, and the treasury
     // is not charged twice.
-    let req2 = engine.create_payment(CreatePayment::default()).await.unwrap();
+    let req2 = engine
+        .create_payment(CreatePayment::default())
+        .await
+        .unwrap();
     let dep2 = keys::parse_ss58(&req2.address).unwrap();
     raw(
         &chain,
@@ -436,7 +445,10 @@ async fn static_address_scan_and_sweep() {
     for who in [&payer, &treasury] {
         chain
             .submit(
-                &ChainCall::TransferTao { dest: id(who), amount: alice_free / 4 },
+                &ChainCall::TransferTao {
+                    dest: id(who),
+                    amount: alice_free / 4,
+                },
                 &alice,
             )
             .await
@@ -448,18 +460,27 @@ async fn static_address_scan_and_sweep() {
         &chain,
         &payer,
         "add_stake",
-        vec![Value::from_bytes(id(&payer_hk).0), pay_net.into(), (5 * RAO_PER_TAO).into()],
+        vec![
+            Value::from_bytes(id(&payer_hk).0),
+            pay_net.into(),
+            (5 * RAO_PER_TAO).into(),
+        ],
     )
     .await;
 
     // Deterministic deposit wallet: a fresh random seed per run, so reruns start clean.
-    let phrase = bip39::Mnemonic::from_entropy(&rand_bytes()).unwrap().to_string();
+    let phrase = bip39::Mnemonic::from_entropy(&rand_bytes())
+        .unwrap()
+        .to_string();
     let seed = Arc::new(keys::DerivationSeed::from_phrase(&phrase).unwrap());
     let path = "//opentype//deposit//0";
     let dep = seed.wallet(path).unwrap().account_id();
     assert_eq!(
         dep,
-        keypair_from_uri(&format!("{phrase}{path}")).unwrap().public_key().to_account_id(),
+        keypair_from_uri(&format!("{phrase}{path}"))
+            .unwrap()
+            .public_key()
+            .to_account_id(),
         "matches the substrate URI derivation"
     );
     let watched: std::collections::BTreeSet<_> = [dep].into();
@@ -494,11 +515,21 @@ async fn static_address_scan_and_sweep() {
         assert!(d.spot_price > 0 && d.tao_value > 0);
         // value reported by the chain is alpha x spot
         let expect = (amount as u128 * d.spot_price as u128 / RAO_PER_TAO as u128) as u64;
-        assert!(d.tao_value.abs_diff(expect) <= 1, "{} vs {expect}", d.tao_value);
+        assert!(
+            d.tao_value.abs_diff(expect) <= 1,
+            "{} vs {expect}",
+            d.tao_value
+        );
         // re-scanning the same block yields the same event identity (idempotency key)
-        let again = chain.deposits_in_block(d.block_number, &watched).await.unwrap();
+        let again = chain
+            .deposits_in_block(d.block_number, &watched)
+            .await
+            .unwrap();
         assert_eq!(again.deposits, vec![d.clone()]);
-        assert_eq!(chain.block_hash_at(d.block_number).await.unwrap(), Some(d.block_hash.clone()));
+        assert_eq!(
+            chain.block_hash_at(d.block_number).await.unwrap(),
+            Some(d.block_hash.clone())
+        );
         found.push(d.clone());
     }
     let total: u64 = found.iter().map(|d| d.alpha).sum();
@@ -515,11 +546,22 @@ async fn static_address_scan_and_sweep() {
         destroy: Destroy::Burn,
         amount: AutoAmount::Fixed(RAO_PER_TAO / 4),
     };
-    let engine = Engine::new(chain.clone(), store.clone(), MasterKey::generate(), treasury.clone(), cfg)
-        .with_seed(seed.clone());
+    let engine = Engine::new(
+        chain.clone(),
+        store.clone(),
+        MasterKey::generate(),
+        treasury.clone(),
+        cfg,
+    )
+    .with_seed(seed.clone());
     engine.ensure_treasury_hotkey().await.unwrap();
     // wrong expected address is refused before anything is stored
-    assert!(engine.create_sweep_job("job-x", path, &keys::ss58(&id(&payer)), None).await.is_err());
+    assert!(
+        engine
+            .create_sweep_job("job-x", path, &keys::ss58(&id(&payer)), None)
+            .await
+            .is_err()
+    );
     let st = engine
         .create_sweep_job("job-1", path, &keys::ss58(&dep), None)
         .await
@@ -543,8 +585,16 @@ async fn static_address_scan_and_sweep() {
     // Emissions keep accruing after the one-shot sweep; that dust is swept by the next job.
     assert!(left < st.swept_alpha, "deposit address swept ({left} left)");
     let (t_alpha_after, _) = chain.alpha_on(&id(&treasury), pay_net).await.unwrap();
-    assert!(t_alpha_after >= t_alpha_before, "treasury received the alpha");
-    println!("sweep job: {} txs, {} alpha swept, {} alpha burned", st.txs.len(), format_amount(st.swept_alpha), format_amount(b.alpha_destroyed));
+    assert!(
+        t_alpha_after >= t_alpha_before,
+        "treasury received the alpha"
+    );
+    println!(
+        "sweep job: {} txs, {} alpha swept, {} alpha burned",
+        st.txs.len(),
+        format_amount(st.swept_alpha),
+        format_amount(b.alpha_destroyed)
+    );
 }
 
 fn rand_bytes() -> [u8; 32] {

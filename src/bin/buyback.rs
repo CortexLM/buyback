@@ -274,12 +274,14 @@ async fn main() -> R<()> {
             let e = engine(&c).await?;
             let metadata =
                 metadata.map(|m| serde_json::from_str(&m).unwrap_or(serde_json::Value::String(m)));
-            print(&e.create_payment(CreatePayment {
-                metadata,
-                callback_url,
-                ..Default::default()
-            })
-            .await?)?;
+            print(
+                &e.create_payment(CreatePayment {
+                    metadata,
+                    callback_url,
+                    ..Default::default()
+                })
+                .await?,
+            )?;
         }
         Cmd::Status { c, id } => print(&engine(&c).await?.status(&id).await?)?,
         Cmd::Retry { c, id } => print(&engine(&c).await?.retry(&id).await?)?,

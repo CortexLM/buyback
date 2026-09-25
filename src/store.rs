@@ -294,11 +294,15 @@ mod tests {
         assert_eq!(v1.version, 1);
         // stale writer loses
         assert!(matches!(s.update(&got).await, Err(Error::Conflict(_))));
-        assert_eq!(s.get("p-1").await.unwrap().unwrap().state, PaymentState::Detected);
+        assert_eq!(
+            s.get("p-1").await.unwrap().unwrap().state,
+            PaymentState::Detected
+        );
         s.insert(&test_record("p-2")).await.unwrap();
         assert_eq!(s.list(&[PaymentState::Pending]).await.unwrap().len(), 1);
         assert_eq!(
-            s.list(&[PaymentState::Pending, PaymentState::Detected]).await
+            s.list(&[PaymentState::Pending, PaymentState::Detected])
+                .await
                 .unwrap()
                 .len(),
             2
@@ -330,7 +334,8 @@ mod tests {
         assert_eq!(
             SqliteStore::open(&path)
                 .unwrap()
-                .get("p-1").await
+                .get("p-1")
+                .await
                 .unwrap()
                 .unwrap()
                 .version,

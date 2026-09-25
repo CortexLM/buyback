@@ -204,7 +204,9 @@ impl Engine {
         let wallet = seed.wallet(derivation_path)?;
         let address = keys::ss58(&wallet.account_id());
         if address != expected_address {
-            return Err(Error::Crypto("derived address does not match the expected one".into()));
+            return Err(Error::Crypto(
+                "derived address does not match the expected one".into(),
+            ));
         }
         // A sealed copy is kept as well; the seed stays authoritative.
         let sealed = wallet.seal_with(&self.keyring, &keys::wallet_aad(id, &address))?;
@@ -858,10 +860,7 @@ impl Engine {
             limit_price,
             allow_partial: self.cfg.allow_partial,
         };
-        let f = self
-            .chain
-            .submit(&buy, &self.treasury)
-            .await?;
+        let f = self.chain.submit(&buy, &self.treasury).await?;
         let (tao_spent, alpha_bought) = f
             .summary
             .stake_added
@@ -877,10 +876,7 @@ impl Engine {
         };
         if destroy != Destroy::Keep && alpha_bought > 0 {
             let call = destroy_call(destroy, hotkey, netuid, alpha_bought);
-            let d = self
-                .chain
-                .submit(&call, &self.treasury)
-                .await?;
+            let d = self.chain.submit(&call, &self.treasury).await?;
             receipt.alpha_destroyed = d
                 .summary
                 .alpha_destroyed

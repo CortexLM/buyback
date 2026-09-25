@@ -163,7 +163,9 @@ impl DerivationSeed {
             .map_err(|_| Error::Crypto("invalid root".into()))?;
         for cc in junctions {
             let secret = mini.expand(schnorrkel::ExpansionMode::Ed25519);
-            mini = secret.hard_derive_mini_secret_key(Some(ChainCode(cc)), b"").0;
+            mini = secret
+                .hard_derive_mini_secret_key(Some(ChainCode(cc)), b"")
+                .0;
         }
         Ok(Zeroizing::new(mini.to_bytes()))
     }
@@ -176,7 +178,11 @@ impl DerivationSeed {
 /// Chain codes of `//a//b//7` (substrate `SecretUri` rules: a number is a SCALE u64, anything
 /// else a SCALE string, blake2-hashed past 32 bytes). Soft junctions are refused.
 fn hard_junctions(path: &str) -> Result<Vec<[u8; 32]>> {
-    let bad = || Error::Config(format!("derivation path {path:?} must be //hard//junctions only"));
+    let bad = || {
+        Error::Config(format!(
+            "derivation path {path:?} must be //hard//junctions only"
+        ))
+    };
     let rest = path.strip_prefix("//").ok_or_else(bad)?;
     rest.split("//")
         .map(|j| {
@@ -227,9 +233,16 @@ impl Keyring {
     pub fn new(active: &str, keys: impl IntoIterator<Item = (String, MasterKey)>) -> Result<Self> {
         let keys: std::collections::BTreeMap<_, _> = keys.into_iter().collect();
         if !keys.contains_key(active) {
-            return Err(Error::Config(format!("active key id {active:?} is not in the keyring")));
+            return Err(Error::Config(format!(
+                "active key id {active:?} is not in the keyring"
+            )));
         }
-        if keys.keys().any(|k| k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+        if keys.keys().any(|k| {
+            k.is_empty()
+                || !k
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        }) {
             return Err(Error::Config("key ids are [A-Za-z0-9_-]+".into()));
         }
         Ok(Self {
@@ -453,7 +466,13 @@ mod tests {
             let addr = ss58(&w.account_id());
             assert!(addr.starts_with('5'), "prefix 42 addresses start with 5");
             assert_eq!(parse_ss58(&addr).unwrap(), w.account_id());
-            assert_eq!(std::str::from_utf8(&w.secret).unwrap().split_whitespace().count(), 24);
+            assert_eq!(
+                std::str::from_utf8(&w.secret)
+                    .unwrap()
+                    .split_whitespace()
+                    .count(),
+                24
+            );
             assert!(seen.insert(addr));
         }
     }
@@ -528,12 +547,20 @@ mod tests {
     #[test]
     fn derivation_matches_substrate_uris_and_is_deterministic() {
         let seed = DerivationSeed::from_phrase(PHRASE).unwrap();
-        for path in ["//opentype//deposit//0", "//opentype//deposit//7", "//Alice", "//a//b//123456789"] {
+        for path in [
+            "//opentype//deposit//0",
+            "//opentype//deposit//7",
+            "//Alice",
+            "//a//b//123456789",
+        ] {
             let ours = seed.wallet(path).unwrap().account_id();
             let uri = keypair_from_uri(&format!("{PHRASE}{path}")).unwrap();
             assert_eq!(ours, uri.public_key().to_account_id(), "{path}");
             // determinism: a second seed from the same phrase gives the same key
-            let again = DerivationSeed::from_phrase(PHRASE).unwrap().wallet(path).unwrap();
+            let again = DerivationSeed::from_phrase(PHRASE)
+                .unwrap()
+                .wallet(path)
+                .unwrap();
             assert_eq!(again.account_id(), ours);
         }
         // `//Alice` from the dev phrase is the well-known Alice
@@ -547,7 +574,10 @@ mod tests {
         assert_ne!(a, b);
         // the mini secret alone rebuilds the key
         let mini = seed.derive_mini("//opentype//deposit//1").unwrap();
-        assert_eq!(PaymentWallet::from_mini_secret(&mini).unwrap().account_id(), a);
+        assert_eq!(
+            PaymentWallet::from_mini_secret(&mini).unwrap().account_id(),
+            a
+        );
     }
 
     #[test]
@@ -570,7 +600,12 @@ mod tests {
         let aad = b"tenant-a/5Fxyz";
         let sealed = w.seal_with(&old, aad).unwrap();
         assert_eq!(sealed.kid.as_deref(), Some("k1"));
-        assert_eq!(PaymentWallet::unseal_with(&old, &sealed, aad).unwrap().account_id(), w.account_id());
+        assert_eq!(
+            PaymentWallet::unseal_with(&old, &sealed, aad)
+                .unwrap()
+                .account_id(),
+            w.account_id()
+        );
         // wrong AAD, tampered ciphertext, unknown key id
         assert!(PaymentWallet::unseal_with(&old, &sealed, b"tenant-b/5Fxyz").is_err());
         let mut t = sealed.clone();
@@ -583,13 +618,34 @@ mod tests {
         assert!(PaymentWallet::unseal_with(&old, &t, aad).is_err());
 
         // rotate: k2 active, k1 kept for reading
-        let new = Keyring::parse(&format!("k1:{},k2:{}", *k1_hex, *MasterKey::generate().to_hex()), "k2").unwrap();
-        assert_eq!(PaymentWallet::unseal_with(&new, &sealed, aad).unwrap().account_id(), w.account_id());
+        let new = Keyring::parse(
+            &format!("k1:{},k2:{}", *k1_hex, *MasterKey::generate().to_hex()),
+            "k2",
+        )
+        .unwrap();
+        assert_eq!(
+            PaymentWallet::unseal_with(&new, &sealed, aad)
+                .unwrap()
+                .account_id(),
+            w.account_id()
+        );
         let resealed = new.reseal(&sealed, aad).unwrap().expect("re-sealed");
         assert_eq!(resealed.kid.as_deref(), Some("k2"));
-        assert!(new.reseal(&resealed, aad).unwrap().is_none(), "already current");
+        assert!(
+            new.reseal(&resealed, aad).unwrap().is_none(),
+            "already current"
+        );
         // after dropping k1 only the re-sealed copy opens
-        let only_k2 = Keyring::parse(&format!("k2:{}", *MasterKey::from_hex(&hex::encode([0u8;32])).unwrap().to_hex()), "k2").unwrap();
+        let only_k2 = Keyring::parse(
+            &format!(
+                "k2:{}",
+                *MasterKey::from_hex(&hex::encode([0u8; 32]))
+                    .unwrap()
+                    .to_hex()
+            ),
+            "k2",
+        )
+        .unwrap();
         assert!(PaymentWallet::unseal_with(&only_k2, &sealed, aad).is_err());
         assert!(Keyring::new("nope", []).is_err());
         assert!(!format!("{new:?}").contains(&*k1_hex));
@@ -603,7 +659,12 @@ mod tests {
         let sealed = w.seal(&k, b"x").unwrap();
         assert!(sealed.kid.is_none());
         let ring: Keyring = MasterKey::from_hex(&hexk).unwrap().into();
-        assert_eq!(PaymentWallet::unseal_with(&ring, &sealed, b"x").unwrap().account_id(), w.account_id());
+        assert_eq!(
+            PaymentWallet::unseal_with(&ring, &sealed, b"x")
+                .unwrap()
+                .account_id(),
+            w.account_id()
+        );
         // serde: no kid field in the JSON of a legacy secret
         assert!(!serde_json::to_string(&sealed).unwrap().contains("kid"));
     }

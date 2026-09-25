@@ -4,7 +4,7 @@
 //! `cargo run --example verify_metadata -- finney [netuid]`
 //! `BITTENSOR_RPC_URL` / `BITTENSOR_RPC_API_KEY` override the network URL (bearer auth);
 //! `BITTENSOR_RPC_FALLBACKS` (comma-separated, keyless) are tried after it.
-use bittensor_buyback::{chain::Endpoint, units::format_amount, Chain, Network};
+use bittensor_buyback::{Chain, Network, chain::Endpoint, units::format_amount};
 
 #[tokio::main]
 async fn main() -> bittensor_buyback::Result<()> {
@@ -22,7 +22,10 @@ async fn main() -> bittensor_buyback::Result<()> {
         }
         Err(_) => eps.push(Endpoint::new(net.url())),
     }
-    for f in std::env::var("BITTENSOR_RPC_FALLBACKS").unwrap_or_default().split(',') {
+    for f in std::env::var("BITTENSOR_RPC_FALLBACKS")
+        .unwrap_or_default()
+        .split(',')
+    {
         if !f.trim().is_empty() {
             eps.push(Endpoint::new(f.trim()));
         }

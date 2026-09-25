@@ -304,17 +304,29 @@ impl Chain {
     /// Connect to one endpoint. `wss://` required unless the host is loopback.
     pub async fn connect_endpoint(ep: &Endpoint) -> Result<Self> {
         use jsonrpsee::client_transport::ws::{Url, WsTransportClientBuilder};
-        let url = Url::parse(&ep.url).map_err(|_| Error::Config(format!("bad RPC url {:?}", ep.url)))?;
-        let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1" | "[::1]"));
+        let url =
+            Url::parse(&ep.url).map_err(|_| Error::Config(format!("bad RPC url {:?}", ep.url)))?;
+        let loopback = matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "::1" | "[::1]")
+        );
         match url.scheme() {
             "wss" => {}
             "ws" if loopback => {}
-            _ => return Err(Error::Config(format!("RPC url {:?} must be wss:// (ws:// only on loopback)", ep.url))),
+            _ => {
+                return Err(Error::Config(format!(
+                    "RPC url {:?} must be wss:// (ws:// only on loopback)",
+                    ep.url
+                )));
+            }
         }
         let mut headers = jsonrpsee::client_transport::ws::HeaderMap::new();
         if let Some(key) = &ep.bearer {
-            let mut v = jsonrpsee::client_transport::ws::HeaderValue::from_str(&format!("Bearer {}", key.as_str()))
-                .map_err(|_| Error::Config("RPC key is not a valid header value".into()))?;
+            let mut v = jsonrpsee::client_transport::ws::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                key.as_str()
+            ))
+            .map_err(|_| Error::Config("RPC key is not a valid header value".into()))?;
             v.set_sensitive(true);
             headers.insert("authorization", v);
         }
@@ -332,7 +344,12 @@ impl Chain {
             .max_buffer_capacity_per_subscription(4096)
             .build_with_tokio(tx, rx);
         let rpc = subxt::rpcs::RpcClient::new(client);
-        let api = Client::from_rpc_client(rpc.clone()).await.map_err(chain_err)?;
+        // Legacy backend: plain `state_*`/`chain_*` methods that every node serves. The default
+        // combined backend prefers `archive_v1_*`, which public nodes advertise but refuse.
+        let backend = subxt::backend::LegacyBackend::builder().build(rpc.clone());
+        let api = Client::from_backend(std::sync::Arc::new(backend))
+            .await
+            .map_err(chain_err)?;
         Ok(Self { api, rpc })
     }
 
@@ -510,7 +527,10 @@ impl Chain {
         }
         let h: Header = self
             .rpc
-            .request("chain_getHeader", subxt::rpcs::rpc_params![Option::<String>::None])
+            .request(
+                "chain_getHeader",
+                subxt::rpcs::rpc_params![Option::<String>::None],
+            )
             .await
             .map_err(chain_err)?;
         u64::from_str_radix(h.number.trim_start_matches("0x"), 16)
@@ -577,7 +597,13 @@ impl Chain {
         let mut ok = std::collections::HashSet::new();
         for ext in exts.iter() {
             let ext = ext.map_err(chain_err)?;
-            hashes.insert(ext.index() as u32, (format!("{:?}", ext.hash()), ext.address_bytes().map(|b| b.to_vec())));
+            hashes.insert(
+                ext.index() as u32,
+                (
+                    format!("{:?}", ext.hash()),
+                    ext.address_bytes().map(|b| b.to_vec()),
+                ),
+            );
         }
         // Only extrinsics that succeeded count (their events would be rolled back otherwise, but
         // be explicit).
@@ -805,7 +831,10 @@ impl Chain {
 }
 
 async fn moving_price_at(
-    at: &subxt::client::ClientAtBlock<SubstrateConfig, subxt::client::OnlineClientAtBlockImpl<SubstrateConfig>>,
+    at: &subxt::client::ClientAtBlock<
+        SubstrateConfig,
+        subxt::client::OnlineClientAtBlockImpl<SubstrateConfig>,
+    >,
     netuid: u16,
 ) -> Result<u64> {
     let addr = dynamic::storage::<(u16,), scale_value::Value>(PALLET, "SubnetMovingPrice");
@@ -1109,7 +1138,10 @@ mod tests {
 
     #[test]
     fn urls_are_redacted_and_endpoint_debug_hides_key() {
-        assert_eq!(redact_url("wss://rpc.example.io/v1?key=abc"), "wss://rpc.example.io");
+        assert_eq!(
+            redact_url("wss://rpc.example.io/v1?key=abc"),
+            "wss://rpc.example.io"
+        );
         assert_eq!(redact_url("wss://user:pw@host:443/x"), "wss://host:443");
         let ep = Endpoint::new("wss://x").with_bearer("s3cr3t");
         assert!(!format!("{ep:?}").contains("s3cr3t"));
@@ -1118,7 +1150,10 @@ mod tests {
 
     #[tokio::test]
     async fn plaintext_remote_rpc_is_refused() {
-        let e = Chain::connect_endpoint(&Endpoint::new("ws://example.com:9944")).await.err().unwrap();
+        let e = Chain::connect_endpoint(&Endpoint::new("ws://example.com:9944"))
+            .await
+            .err()
+            .unwrap();
         assert!(e.to_string().contains("wss"));
     }
 
