@@ -18,6 +18,10 @@ use subxt::dynamic::{self, Value};
 use subxt::utils::AccountId32;
 use subxt_signer::sr25519::Keypair;
 
+// ponytail: these fixtures share Alice and global subnet registration state;
+// serialize this test binary until each fixture has an isolated local chain.
+static LOCALNET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn url() -> String {
     std::env::var("BUYBACK_LOCALNET_URL").unwrap_or_else(|_| "ws://127.0.0.1:9944".into())
 }
@@ -88,6 +92,7 @@ async fn new_subnet(chain: &Chain, owner: &Keypair, hotkey: &Keypair, env: &str)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_flow() {
+    let _chain_guard = LOCALNET.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,bittensor_buyback=debug")
         .try_init();
@@ -134,6 +139,14 @@ async fn full_flow() {
         destroy: Destroy::Burn,
         amount: AutoAmount::Fixed(RAO_PER_TAO / 2),
     };
+    cfg.buyback_budget = Some(bittensor_buyback::state::BuybackBudget {
+        amount_rao: RAO_PER_TAO / 2,
+        currency: "TAO".into(),
+        source: "localnet-test-allocation".into(),
+        hotkey: keys::ss58(&id(&treasury_hk)),
+        netuid: buy_net,
+        destroy: Destroy::Burn,
+    });
     let master_hex = MasterKey::generate().to_hex();
     let engine = Arc::new(Engine::new(
         chain.clone(),
@@ -143,6 +156,22 @@ async fn full_flow() {
         cfg.clone(),
     ));
     let mut settled = engine.subscribe();
+    // Explicit isolated-localnet provisioning, never engine startup behavior.
+    if chain
+        .hotkey_owner(&id(&treasury_hk))
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(engine.ensure_treasury_hotkey().await.is_err());
+        raw(
+            &chain,
+            &treasury,
+            "try_associate_hotkey",
+            vec![Value::from_bytes(id(&treasury_hk).0)],
+        )
+        .await;
+    }
     engine.ensure_treasury_hotkey().await.unwrap();
     assert_eq!(
         chain.hotkey_owner(&id(&treasury_hk)).await.unwrap(),
@@ -318,6 +347,10 @@ async fn full_flow() {
         PaymentState::Detected
     );
     let fee_tao = RAO_PER_TAO / 100;
+    let reservation = store
+        .reserve_signer(&keys::ss58(&id(&treasury)), &req2.id)
+        .await
+        .unwrap();
     let prepared = chain
         .prepare(
             &ChainCall::TransferTao {
@@ -329,6 +362,7 @@ async fn full_flow() {
         .await
         .unwrap();
     let journal = Some(bittensor_buyback::chain::PendingTx {
+        reservation: Some(reservation),
         action: Action::Fund,
         signer: keys::ss58(&id(&treasury)),
         nonce: prepared.nonce,
@@ -336,10 +370,10 @@ async fn full_flow() {
         birth_block: prepared.birth_block,
         amount: fee_tao,
     });
-    chain.broadcast(&prepared).await.unwrap();
     let mut rec = store.get(&req2.id).await.unwrap().unwrap();
     rec.pending = journal;
     store.update(&rec).await.unwrap();
+    chain.broadcast(&prepared).await.unwrap();
     let engine2 = Arc::new(Engine::new(
         chain.clone(),
         store.clone(),
@@ -373,53 +407,18 @@ async fn full_flow() {
     );
     assert!(s2.swept_alpha >= RAO_PER_TAO);
 
-    // --- explicit buyback (keep) and buyback_and_burn ---
-    let thk = id(&treasury_hk);
-    let a0 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t0 = chain.free_balance(&tre).await.unwrap();
-    let r1 = engine.buyback(RAO_PER_TAO).await.unwrap();
-    let a1 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t1 = chain.free_balance(&tre).await.unwrap();
-    println!(
-        "--- buyback 1 TAO ---\n{r1:?}\ntreasury TAO {} -> {}, alpha(netuid {buy_net}) {} -> {}",
-        format_amount(t0),
-        format_amount(t1),
-        format_amount(a0),
-        format_amount(a1)
-    );
-    assert_eq!(r1.tao_spent, RAO_PER_TAO);
-    assert!(r1.alpha_bought > 0 && r1.destroy_tx.is_none());
-    assert!(t1 <= t0 - RAO_PER_TAO);
-    assert!((a1 - a0).abs_diff(r1.alpha_bought) <= 1, "{a0} -> {a1}");
-
-    let r2 = engine.buyback_and_burn(RAO_PER_TAO).await.unwrap();
-    let a2 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t2 = chain.free_balance(&tre).await.unwrap();
-    println!(
-        "--- buyback_and_burn 1 TAO ---\n{r2:?}\ntreasury TAO {} -> {}, alpha(netuid {buy_net}) {} -> {}",
-        format_amount(t1),
-        format_amount(t2),
-        format_amount(a1),
-        format_amount(a2)
-    );
-    assert!(r2.destroy_tx.is_some());
-    assert_eq!(r2.alpha_destroyed, r2.alpha_bought);
-    assert!(t2 <= t1 - RAO_PER_TAO);
-    assert!(
-        a2.abs_diff(a1) <= 1,
-        "bought alpha was burned: {a1} -> {a2}"
-    );
-
-    // recycle variant
-    let r3 = engine.buyback_and_recycle(RAO_PER_TAO / 2).await.unwrap();
-    println!("--- buyback_and_recycle 0.5 TAO ---\n{r3:?}");
-    assert_eq!(r3.alpha_destroyed, r3.alpha_bought);
-
-    // Guard: cannot spend beyond the reserve.
-    assert!(matches!(
-        engine.buyback(u64::MAX / 2).await,
-        Err(Error::Insufficient(_))
-    ));
+    // Standalone wrappers cannot bypass the durable job protocol.
+    let balance = chain.free_balance(&tre).await.unwrap();
+    for result in [
+        engine.buyback(RAO_PER_TAO).await,
+        engine.buyback_and_burn(RAO_PER_TAO).await,
+        engine.buyback_and_recycle(RAO_PER_TAO).await,
+        engine.buyback_all(Destroy::Burn).await,
+        engine.buyback_with(RAO_PER_TAO, Destroy::Keep).await,
+    ] {
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+    assert_eq!(chain.free_balance(&tre).await.unwrap(), balance);
 }
 
 /// Static deposit address: a deterministic wallet receives two `transfer_stake`s, the block
@@ -427,6 +426,7 @@ async fn full_flow() {
 /// treasury and burns a buyback.
 #[tokio::test(flavor = "multi_thread")]
 async fn static_address_scan_and_sweep() {
+    let _chain_guard = LOCALNET.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,bittensor_buyback=debug")
         .try_init();
@@ -546,6 +546,14 @@ async fn static_address_scan_and_sweep() {
         destroy: Destroy::Burn,
         amount: AutoAmount::Fixed(RAO_PER_TAO / 4),
     };
+    cfg.buyback_budget = Some(bittensor_buyback::state::BuybackBudget {
+        amount_rao: RAO_PER_TAO / 4,
+        currency: "TAO".into(),
+        source: "localnet-test-allocation".into(),
+        hotkey: keys::ss58(&id(&treasury_hk)),
+        netuid: buy_net,
+        destroy: Destroy::Burn,
+    });
     let engine = Engine::new(
         chain.clone(),
         store.clone(),
@@ -554,6 +562,22 @@ async fn static_address_scan_and_sweep() {
         cfg,
     )
     .with_seed(seed.clone());
+    // Explicit isolated-localnet provisioning, never engine startup behavior.
+    if chain
+        .hotkey_owner(&id(&treasury_hk))
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(engine.ensure_treasury_hotkey().await.is_err());
+        raw(
+            &chain,
+            &treasury,
+            "try_associate_hotkey",
+            vec![Value::from_bytes(id(&treasury_hk).0)],
+        )
+        .await;
+    }
     engine.ensure_treasury_hotkey().await.unwrap();
     // wrong expected address is refused before anything is stored
     assert!(

@@ -76,9 +76,12 @@ struct Common {
     /// Automatic buyback per settled payment: off | keep | burn | recycle
     #[arg(long, env = "BUYBACK_AUTO", default_value = "off")]
     auto: String,
-    /// Auto amount: all, payment, or a TAO amount
+    /// Fixed additional TAO allocation per new job; required when auto is enabled
     #[arg(long, env = "BUYBACK_AUTO_AMOUNT", default_value = "payment")]
     auto_amount: String,
+    /// Operator allocation reference for additional treasury capital
+    #[arg(long, env = "BUYBACK_AUTO_SOURCE")]
+    auto_source: Option<String>,
     /// Default settlement webhook
     #[arg(long, env = "BUYBACK_WEBHOOK_URL")]
     webhook_url: Option<String>,
@@ -111,6 +114,19 @@ enum Cmd {
     VerifyMetadata {
         #[arg(long, env = "BUYBACK_NETWORK", default_value = "local")]
         network: String,
+    },
+    /// Verify a legacy manifest against a trusted archive; no signing keys are loaded.
+    #[cfg(feature = "sqlite")]
+    RecoverLegacy {
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        #[arg(long)]
+        database: std::path::PathBuf,
+        #[arg(long)]
+        archive: String,
+        /// Commit policy and audit evidence after verification. Default is read-only dry run.
+        #[arg(long)]
+        apply: bool,
     },
     /// Create a payment request.
     Create {
@@ -198,17 +214,27 @@ async fn engine(c: &Common) -> R<Engine> {
     cfg.fee_margin_bps = c.fee_margin_bps;
     cfg.fee_reserve = units::parse_amount(&c.fee_reserve)?;
     cfg.webhook_url = c.webhook_url.clone();
-    cfg.auto = match c.auto.as_str() {
-        "off" => AutoBuyback::Off,
-        d => AutoBuyback::On {
-            destroy: destroy(d)?,
-            amount: match c.auto_amount.as_str() {
-                "all" => AutoAmount::All,
-                "payment" => AutoAmount::PaymentValueBps(10_000),
-                a => AutoAmount::Fixed(units::parse_amount(a)?),
-            },
-        },
-    };
+    if c.auto != "off" {
+        let amount = units::parse_amount(&c.auto_amount)?;
+        let destroy = destroy(&c.auto)?;
+        let budget = bittensor_buyback::state::BuybackBudget {
+            amount_rao: amount,
+            currency: "TAO".into(),
+            hotkey: c.treasury_hotkey.clone(),
+            source: c
+                .auto_source
+                .clone()
+                .ok_or("--auto-source required for automatic buyback")?,
+            netuid: c.buyback_netuid,
+            destroy,
+        };
+        budget.validate()?;
+        cfg.buyback_budget = Some(budget);
+        cfg.auto = AutoBuyback::On {
+            destroy,
+            amount: AutoAmount::Fixed(amount),
+        };
+    }
     let chain = Chain::connect(net.url()).await?;
     let store: Arc<dyn bittensor_buyback::Store> = Arc::from(open_store(&c.store)?);
     #[allow(unused_mut)]
@@ -266,6 +292,41 @@ async fn main() -> R<()> {
                 println!("{line}");
             }
         }
+        #[cfg(feature = "sqlite")]
+        Cmd::RecoverLegacy {
+            manifest,
+            database,
+            archive,
+            apply,
+        } => {
+            use bittensor_buyback::Store;
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(manifest)?
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                return Err("manifest too large".into());
+            }
+            let manifest: bittensor_buyback::recovery::LegacyManifest =
+                serde_json::from_slice(&bytes)?;
+            let mut store = if apply {
+                bittensor_buyback::SqliteStore::open(database)?
+            } else {
+                bittensor_buyback::SqliteStore::open_read_only(database)?
+            };
+            let record = store
+                .get(&manifest.job)
+                .await?
+                .ok_or("legacy job not found")?;
+            let chain = Chain::connect(&archive).await?;
+            let report = if apply {
+                store.recover_legacy(&chain, &manifest).await?
+            } else {
+                bittensor_buyback::recovery::dry_run(&chain, &record, &manifest).await?
+            };
+            print(&report)?;
+        }
         Cmd::Create {
             c,
             metadata,
@@ -305,16 +366,10 @@ async fn main() -> R<()> {
             }
             e.run().await?;
         }
-        Cmd::Buyback { c, amount, then } => {
-            let e = engine(&c).await?;
-            e.ensure_treasury_hotkey().await?;
-            let d = destroy(&then)?;
-            let r = if amount == "all" {
-                e.buyback_all(d).await?
-            } else {
-                e.buyback_with(units::parse_amount(&amount)?, d).await?
-            };
-            print(&r)?;
+        Cmd::Buyback { .. } => {
+            return Err(bittensor_buyback::Error::Config(
+                "standalone buyback disabled; use a durable payment/sweep job with an explicit buyback budget".into(),
+            ).into());
         }
         Cmd::Balances { c } => {
             let e = engine(&c).await?;

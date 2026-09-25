@@ -102,8 +102,11 @@ The localnet test covers this directly. It sends the funding transfer, "crashes"
 it, starts a new engine on the same store, and asserts the payment settles with the fee sent
 **exactly once**.
 
-Standalone `buyback*()` calls are *not* journaled. They are operator actions. If one errors,
-check `buyback balances` before running it again.
+Standalone `Engine::buyback*()` calls and the CLI buyback command now fail closed with
+`Error::Config` before signing or submission. This is a compatibility change: use a durable
+payment/sweep job with an explicit immutable `BuybackBudget` and drive `Engine::tick`.
+There is no standalone-job replacement yet. `Chain::prepare`/`broadcast`/`submit` remain
+low-level primitives without Store ownership guarantees; never mix them with live workers.
 
 ## Static deposit addresses
 
@@ -144,19 +147,20 @@ let master = MasterKey::from_env("BUYBACK_MASTER_KEY")?;
 let treasury = TreasuryKeySource::EncryptedKeystore("treasury.json".into()).load(Some(&master))?;
 let mut cfg = Config::new(Network::Finney.url(), 42 /* payment netuid */,
                           keys::parse_ss58("5...treasury hotkey")?);
-cfg.auto = AutoBuyback::On { destroy: Destroy::Burn, amount: AutoAmount::PaymentValueBps(10_000) };
+cfg.buyback_budget = Some(state::BuybackBudget {
+    amount_rao: units::parse_amount("0.5")?, currency: "TAO".into(),
+    source: "approved-working-capital".into(), netuid: 100, destroy: Destroy::Burn,
+    hotkey: keys::ss58(&cfg.treasury_hotkey),
+});
 let engine = Arc::new(Engine::new(chain, store, master, treasury, cfg));
-engine.ensure_treasury_hotkey().await?;               // try_associate_hotkey if missing
+engine.ensure_treasury_hotkey().await?;               // read-only; fails if hotkey is missing
 
-let req: PaymentRequest = engine.create_payment(CreatePayment::default())?;
-let status: PaymentStatus = engine.status(&req.id)?;
+let req: PaymentRequest = engine.create_payment(CreatePayment::default()).await?;
+let status: PaymentStatus = engine.status(&req.id).await?;
 let mut settled = engine.subscribe();                 // in-process callback
 tokio::spawn({ let e = engine.clone(); async move { e.run().await } });
 
-engine.buyback(units::parse_amount("10")?).await?;          // buy, keep staked
-engine.buyback_and_burn(units::parse_amount("10")?).await?; // buy, burn_alpha
-engine.buyback_and_recycle(units::RAO_PER_TAO).await?;      // buy, recycle_alpha
-engine.buyback_all(Destroy::Burn).await?;                   // whole balance - fee_reserve
+// Standalone buyback wrappers are disabled; the job above carries its budget.
 # Ok(()) }
 ```
 
@@ -167,8 +171,8 @@ engine.buyback_all(Destroy::Burn).await?;                   // whole balance - f
 | `Engine::run()` / `Engine::tick()` | follow finalized blocks / one pass |
 | `Engine::subscribe()` | `broadcast::Receiver<PaymentStatus>` for settled/failed/expired |
 | `Engine::retry(id)`, `Engine::force_sweep(id)` | operator recovery |
-| `Engine::buyback`, `buyback_and_burn`, `buyback_and_recycle`, `buyback_all`, `buyback_with` | treasury buybacks, return `BuybackReceipt` |
-| `Engine::ensure_treasury_hotkey()` | create the treasury hotkey account if missing |
+| `Engine::buyback`, `buyback_and_burn`, `buyback_and_recycle`, `buyback_all`, `buyback_with` | disabled; return `Error::Config`, migrate to budgeted jobs |
+| `Engine::ensure_treasury_hotkey()` | verify a pre-provisioned treasury hotkey; never submit at startup |
 | `Chain` | `verify_metadata`, `stake_positions`, `alpha_price`, `estimate_fee`, `submit`, `find_pending` |
 | `Store` trait, `SqliteStore`, `FileStore`, `open_store("sqlite:..."/"file:...")` | persistence with compare-and-swap |
 | `MasterKey`, `PaymentWallet`, `TreasuryKeySource` | key custody |
@@ -188,7 +192,7 @@ export BUYBACK_NETWORK=local BUYBACK_NETUID=2 BUYBACK_TREASURY_HOTKEY=5...
 buyback create --metadata '{"order":123}'
 buyback status <id>
 buyback run --listen 127.0.0.1:8080      # watcher + HTTP (http feature)
-buyback buyback 10 --then burn           # or `all`, --then keep|burn|recycle
+buyback buyback 10 --then burn           # disabled: use budgeted durable jobs
 buyback balances
 ```
 
@@ -227,7 +231,7 @@ receivers must deduplicate on `id`.
 | `buyback_netuid` | `BUYBACK_NETUID_TARGET` | **100** | |
 | `slippage_bps` | `BUYBACK_SLIPPAGE_BPS` | 100 (1 %) | `limit_price = spot * (1 + bps/1e4)` |
 | `allow_partial` | - | false | fill-or-kill by default |
-| `auto` | `BUYBACK_AUTO` / `BUYBACK_AUTO_AMOUNT` | off | `keep`/`burn`/`recycle` x `all` / `payment` (spot value of the swept alpha) / fixed amount |
+| `auto` | `BUYBACK_AUTO` / `BUYBACK_AUTO_AMOUNT` | off | `keep`/`burn`/`recycle` with fixed TAO amount and `BUYBACK_AUTO_SOURCE` |
 | `max_attempts` | - | 8 | |
 
 Treasury coldkey sources (`TreasuryKeySource`): `EnvUri` (mnemonic or secret URI in an env var),
@@ -266,7 +270,7 @@ subnet issuance is tracked
 | effect | alpha is permanently destroyed and counted as burned supply. Issuance keeps counting it, so the emission schedule (which follows issuance) is unaffected | alpha goes back to the "unissued" pool: issuance and outstanding supply shrink, so it can be emitted again |
 
 For a "buy and burn" that permanently removes supply and shows up as burned, use `burn_alpha`,
-which is what `buyback_and_burn` does. `buyback_and_recycle` and `Destroy::Recycle` are there if
+which is what budgeted jobs with `Destroy::Burn` do. `Destroy::Recycle` is available if
 you want the alpha returned to future emissions instead. Neither can be undone. Neither works on
 the root subnet (`CannotBurnOrRecycleOnRootSubnet`), and the hotkey must exist on chain.
 
@@ -321,8 +325,8 @@ alpha to a fresh deposit address. The test then checks:
   balances before and after;
 * a simulated restart mid-flow;
 * a crash-after-broadcast recovery that must not fund twice;
-* `buyback`, `buyback_and_burn` and `buyback_and_recycle`, with their balance and event deltas;
-* the fee-reserve guard.
+* standalone wrappers refused without a treasury balance change;
+* durable job budget and fee-reserve guards.
 
 It only uses well-known dev accounts (`//Alice`, `//Bob` and their derivations). CI runs it
 against the localnet image as a service container.
@@ -332,8 +336,9 @@ against the localnet image as a service container.
 1. Run `buyback verify-metadata --network finney` and confirm every call and event resolves.
 2. Generate the master key and store it in your secret manager. Seal the treasury mnemonic into a
    keystore (`seal-treasury`).
-3. Pick the treasury hotkey. Either use a hotkey you own and have registered, or let
-   `ensure_treasury_hotkey` run `try_associate_hotkey`. It must not be a subnet system account.
+3. Provision the treasury hotkey before starting signing workers.
+   `ensure_treasury_hotkey` is read-only and fails when the hotkey is absent.
+   It must not be a subnet system account.
 4. Fund the treasury coldkey with working TAO for fees, and set `fee_reserve`.
 5. Start with `auto = off` and a small `min_alpha`. Do one real payment, check `buyback status`,
    then enable auto-buyback.
@@ -347,3 +352,83 @@ against the localnet image as a service container.
 MIT OR Apache-2.0.
 
 [`subxt`]: https://github.com/paritytech/subxt
+
+### Strict automatic jobs and shared signer ownership
+
+Automatic jobs now require `Config.buyback_budget`: an explicit `BuybackBudget`
+with `amount_rao`, `currency="TAO"`, nonempty allocation `source`, target `netuid`,
+and `destroy`. This is additional treasury capital, not a sale of deposited alpha.
+The budget is frozen at job creation; stores reject later modifications. Missing
+budgets, insufficient capital, zero purchases, partial spends, and incomplete burns
+block completion. Legacy dynamic `AutoAmount` values do not allocate job capital.
+CLI automatic mode requires a numeric `--auto-amount` and `--auto-source`.
+Existing jobs without policy require explicit operator review. `Store::migrate_legacy_policy(id,
+expected_version, budget)` supports pristine Pending/Detected legacy jobs in SQLite
+and the single-process FileStore; `None` explicitly selects no buyback. Existing
+policy, reservations, journals, receipts or other execution evidence refuse migration.
+Ambiguous/partially executed legacy jobs still require manual chain reconciliation;
+never clear their evidence or overwrite a policy. FileStore migration does not enable signing.
+
+This is a blocked recovery path, not evidence that funds were lost. Records and receipts
+are preserved; rejection does not manufacture a persisted quarantine record.
+`TxRef` retains action, extrinsic/block hashes and amount, but not signer, nonce or
+full call targets/parameters. Those require authenticated finalized archive data.
+Neither chain history nor old receipts establish the original auto-buyback intent,
+capital source/allocation or destruction policy; mutable runtime defaults cannot recover
+that intent. Records also lack a genesis hash, and receipts alone cannot establish that
+no additional pre-journal action was emitted before a crash.
+
+`buyback recover-legacy --manifest manifest.json --database jobs.sqlite --archive
+wss://trusted-archive` performs a read-only dry run. Add `--apply` only during offline
+operator maintenance. No signing keys are loaded. The `recovery::LegacyManifest`
+requires genesis, treasury, treasury hotkey, explicit consolidation/dust settings,
+budget (including explicit null for no buyback), exact extrinsics with block/index,
+signer/nonce, receipts and full `ChainCall` parameters. New jobs freeze those identity
+and configuration fields; a mismatched or missing identity blocks processing, including
+pending reconciliation. The older budget-only migration does not establish identity.
+
+An operator must attest that ALL old emitters stopped, that `first_block` covers ALL
+old emissions, and the historical maximum mortal-signature lifetime. Record the evidence
+reference in `operator_attestation`. Unknown mortality or unpublished immortal signatures
+preclude recovery. Never infer historical mortality from today's defaults. The archive
+is a trusted RPC source, not a light-client finality proof; operator attestations cannot
+be proven from on-chain data. This trust assumption is mandatory and residual.
+
+The importer scans both signers through a finalized anchor beyond that lifetime,
+compares every signed call/hash/nonce and its successful events, then reproduces stored
+accounting. Any unrelated signer activity, archive gap, missing receipt, unresolved
+reservation, journal or quarantine refuses import. Only pristine jobs and completely
+explained Funded/Swept prefixes (including Failed at those stages) are supported.
+Conservative replay may reject valid histories with skipped consolidation or dust steps.
+It never reconstructs missing receipts or clears orphan reservations.
+
+Apply holds an SQLite write transaction through a fresh archive scan, checks the version,
+and commits policy/identity plus the full manifest and finalized anchor in
+`legacy_recoveries` atomically. Cancellation/error rolls back; repeated import refuses.
+State, receipts and sealed keys remain intact; failed jobs still require explicit retry.
+Missing evidence means refusal, not automatic policy assignment, release or retry.
+
+
+SQLite reserves each signer exclusively before preparing a transaction. Reservation
+ownership is durable and has no lease expiry. The matching pending journal and its
+release are committed atomically after verified finality or complete mortality-window
+absence. A crash before journaling leaves an orphan reservation: signing remains
+blocked pending explicit operator reconciliation; there is no expiry-based unlock.
+A returned preparation error (before broadcast/journal persistence) cancels only
+that live caller's exact token, atomically checking no pending journal exists.
+Journal-write uncertainty and cancelled futures retain ownership.
+Use one shared SQLite database on a filesystem supporting SQLite locking. Different
+database files, unrelated applications using the same key, and separate hosts with
+independent stores are **not** protected. Namespace the database per chain.
+
+`FileStore` and custom `Store` implementations without durable reservations refuse
+engine signing. A PostgreSQL adapter must implement equivalent shared ownership and
+atomic journal release before enabling signing. Standalone Engine buyback methods
+are disabled; raw Chain primitives have no durable ownership guarantee.
+
+Offline regressions drive the actual `Engine::tick` through funding, sweeping,
+purchase and burn, reopening the store and reconstructing the engine after every
+lost broadcast response. Separate processes contend for one SQLite signer and
+prove orphan ownership survives restart. This is simulated transport, not a live
+chain or production readiness claim. `Chain::block_timestamp_ms(hash)` reads exact
+block time; historical USD still requires an independently verified provider.

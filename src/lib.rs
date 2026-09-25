@@ -8,6 +8,7 @@ pub mod error;
 #[cfg(feature = "http")]
 pub mod http;
 pub mod keys;
+pub mod recovery;
 pub mod state;
 pub mod store;
 pub mod units;
