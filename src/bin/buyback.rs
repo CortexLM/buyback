@@ -318,16 +318,10 @@ async fn main() -> R<()> {
             }
             e.run().await?;
         }
-        Cmd::Buyback { c, amount, then } => {
-            let e = engine(&c).await?;
-            e.ensure_treasury_hotkey().await?;
-            let d = destroy(&then)?;
-            let r = if amount == "all" {
-                e.buyback_all(d).await?
-            } else {
-                e.buyback_with(units::parse_amount(&amount)?, d).await?
-            };
-            print(&r)?;
+        Cmd::Buyback { .. } => {
+            return Err(bittensor_buyback::Error::Config(
+                "standalone buyback disabled; use a durable payment/sweep job with an explicit buyback budget".into(),
+            ).into());
         }
         Cmd::Balances { c } => {
             let e = engine(&c).await?;
