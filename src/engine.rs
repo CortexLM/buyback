@@ -1034,6 +1034,7 @@ impl EngineRpc for Chain {
 /// Narrow transaction seam; tests supply no network client or live signer.
 #[async_trait::async_trait]
 pub trait TransactionRpc: Send + Sync {
+    /// Reads and local signing only. Never submits or propagates the signed bytes.
     async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx>;
     async fn broadcast(&self, tx: &PreparedTx) -> Result<FinalizedTx>;
     async fn find_pending(&self, tx: &PendingTx) -> Result<PendingOutcome>;
@@ -1065,9 +1066,21 @@ async fn send_journaled(
     }
     let signer_address = keys::ss58(&signer.public_key().to_account_id());
     let reservation = store.reserve_signer_for_record(&signer_address, r).await?;
-    // A crash or prepare error leaves an orphan reservation: never expire it automatically.
-    let prepared = rpc.prepare(call, signer).await?;
+    // prepare MUST NOT broadcast. A returned preparation error is known pre-send;
+    // cancellation/crash of this future still leaves its ownership fenced.
+    let prepared = match rpc.prepare(call, signer).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            store
+                .cancel_preparation(&signer_address, &r.id, &reservation)
+                .await?;
+            return Err(error);
+        }
+    };
     if prepared.signer != signer_address {
+        store
+            .cancel_preparation(&signer_address, &r.id, &reservation)
+            .await?;
         return Err(Error::Store("prepared signer mismatch".into()));
     }
     let mut journal = r.clone();
@@ -1211,6 +1224,107 @@ mod journal_rpc_tests {
     use super::*;
     use crate::{keys::MasterKey, store::SqliteStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    struct PrepareFailure;
+    #[async_trait::async_trait]
+    impl TransactionRpc for PrepareFailure {
+        async fn prepare(&self, _: &ChainCall, _: &Keypair) -> Result<PreparedTx> {
+            Err(Error::Chain("prepare RPC timeout before submission".into()))
+        }
+        async fn broadcast(&self, _: &PreparedTx) -> Result<FinalizedTx> {
+            panic!("must not broadcast")
+        }
+        async fn find_pending(&self, _: &PendingTx) -> Result<PendingOutcome> {
+            panic!("no journal")
+        }
+    }
+    #[tokio::test]
+    async fn returned_prepare_failure_releases_only_prebroadcast_ownership() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut rec = crate::state::test_record("prepare-error");
+        store.insert(&rec).await.unwrap();
+        let signer = keys::keypair_from_uri("//Alice").unwrap();
+        let address = keys::ss58(&signer.public_key().to_account_id());
+        let call = ChainCall::TransferTao {
+            dest: signer.public_key().to_account_id(),
+            amount: 1,
+        };
+        for _ in 0..2 {
+            assert!(
+                send_journaled(
+                    &PrepareFailure,
+                    &store,
+                    &mut rec,
+                    Action::Fund,
+                    &call,
+                    &signer
+                )
+                .await
+                .is_err()
+            );
+            assert!(store.get(&rec.id).await.unwrap().unwrap().pending.is_none());
+        }
+        store.reserve_signer(&address, "other-job").await.unwrap();
+    }
+    struct StalledPrepare;
+    #[async_trait::async_trait]
+    impl TransactionRpc for StalledPrepare {
+        async fn prepare(&self, _: &ChainCall, _: &Keypair) -> Result<PreparedTx> {
+            std::future::pending().await
+        }
+        async fn broadcast(&self, _: &PreparedTx) -> Result<FinalizedTx> {
+            panic!("must not broadcast")
+        }
+        async fn find_pending(&self, _: &PendingTx) -> Result<PendingOutcome> {
+            panic!("no journal")
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_preparation_and_crash_before_journal_stay_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prepare.sqlite");
+        let store = SqliteStore::open(&path).unwrap();
+        let mut rec = crate::state::test_record("cancelled-prepare");
+        store.insert(&rec).await.unwrap();
+        let signer = keys::keypair_from_uri("//Alice").unwrap();
+        let address = keys::ss58(&signer.public_key().to_account_id());
+        let call = ChainCall::TransferTao {
+            dest: signer.public_key().to_account_id(),
+            amount: 1,
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                send_journaled(
+                    &StalledPrepare,
+                    &store,
+                    &mut rec,
+                    Action::Fund,
+                    &call,
+                    &signer
+                )
+            )
+            .await
+            .is_err()
+        );
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.reserve_signer(&address, "other").await.is_err());
+        let bob = keys::keypair_from_uri("//Bob").unwrap();
+        let bob_address = keys::ss58(&bob.public_key().to_account_id());
+        let rpc = LostReply {
+            broadcasts: AtomicUsize::new(0),
+            summary: EventSummary::default(),
+            lookup: AtomicUsize::new(0),
+            dead: false,
+        };
+        store.reserve_signer(&bob_address, &rec.id).await.unwrap();
+        let prepared = rpc.prepare(&call, &bob).await.unwrap();
+        assert_eq!(prepared.signer, bob_address);
+        drop(store); // process disappears after prepare, before journal persistence
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.reserve_signer(&bob_address, "other").await.is_err());
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+    }
     struct LostReply {
         broadcasts: AtomicUsize,
         summary: EventSummary,

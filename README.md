@@ -361,13 +361,21 @@ The budget is frozen at job creation; stores reject later modifications. Missing
 budgets, insufficient capital, zero purchases, partial spends, and incomplete burns
 block completion. Legacy dynamic `AutoAmount` values do not allocate job capital.
 CLI automatic mode requires a numeric `--auto-amount` and `--auto-source`.
-Existing jobs without budgets require explicit migration/review, not runtime defaults.
+Existing jobs without policy require explicit operator review. `Store::migrate_legacy_policy(id,
+expected_version, budget)` supports pristine Pending/Detected legacy jobs in SQLite
+and the single-process FileStore; `None` explicitly selects no buyback. Existing
+policy, reservations, journals, receipts or other execution evidence refuse migration.
+Ambiguous/partially executed legacy jobs still require manual chain reconciliation;
+never clear their evidence or overwrite a policy. FileStore migration does not enable signing.
 
 SQLite reserves each signer exclusively before preparing a transaction. Reservation
 ownership is durable and has no lease expiry. The matching pending journal and its
 release are committed atomically after verified finality or complete mortality-window
 absence. A crash before journaling leaves an orphan reservation: signing remains
-blocked pending explicit operator reconciliation; there is no automatic unlock API.
+blocked pending explicit operator reconciliation; there is no expiry-based unlock.
+A returned preparation error (before broadcast/journal persistence) cancels only
+that live caller's exact token, atomically checking no pending journal exists.
+Journal-write uncertainty and cancelled futures retain ownership.
 Use one shared SQLite database on a filesystem supporting SQLite locking. Different
 database files, unrelated applications using the same key, and separate hosts with
 independent stores are **not** protected. Namespace the database per chain.

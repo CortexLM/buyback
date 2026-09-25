@@ -31,6 +31,20 @@ pub trait Store: Send + Sync + 'static {
             "shared durable signer reservations unsupported; signing disabled".into(),
         ))
     }
+    /// Only the live preparing caller may release its token before any broadcast.
+    /// Never use this for crash recovery, journal-write errors, or pending transactions.
+    async fn cancel_preparation(&self, _signer: &str, _job: &str, _token: &str) -> Result<()> {
+        Err(Error::Store("preparation cancellation unsupported".into()))
+    }
+    /// Explicit operator migration of a pristine legacy record, never a runtime default.
+    async fn migrate_legacy_policy(
+        &self,
+        _id: &str,
+        _version: u64,
+        _budget: Option<crate::state::BuybackBudget>,
+    ) -> Result<PaymentRecord> {
+        Err(Error::Store("legacy policy migration unsupported".into()))
+    }
     /// Insert a new record (version 0). Fails if the id exists.
     async fn insert(&self, rec: &PaymentRecord) -> Result<()>;
     async fn get(&self, id: &str) -> Result<Option<PaymentRecord>>;
@@ -43,6 +57,45 @@ pub trait Store: Send + Sync + 'static {
 
 fn store_err(e: impl std::fmt::Display) -> Error {
     Error::Store(e.to_string())
+}
+
+fn migrated_policy(
+    mut rec: PaymentRecord,
+    version: u64,
+    budget: Option<crate::state::BuybackBudget>,
+) -> Result<PaymentRecord> {
+    if rec.version != version {
+        return Err(Error::Conflict(rec.id));
+    }
+    if rec.auto_required.is_some()
+        || rec.buyback_budget.is_some()
+        || rec.pending.is_some()
+        || rec.quarantined.is_some()
+        || !rec.txs.is_empty()
+        || rec.buyback.is_some()
+        || rec.buyback_done
+        || rec.funded_tao != 0
+        || rec.swept_alpha != 0
+        || !rec.swept_positions.is_empty()
+        || rec.consolidated != 0
+        || rec.dust_returned
+        || !matches!(rec.state, PaymentState::Pending | PaymentState::Detected)
+    {
+        return Err(Error::Store(
+            "legacy job has policy or execution evidence; manual reconciliation required".into(),
+        ));
+    }
+    if let Some(b) = &budget {
+        b.validate()?;
+    }
+    rec.auto_required = Some(budget.is_some());
+    rec.buyback_budget = budget;
+    rec.version = rec
+        .version
+        .checked_add(1)
+        .ok_or_else(|| Error::Store("version overflow".into()))?;
+    rec.updated_at = crate::state::now();
+    Ok(rec)
 }
 
 /// One JSON file per payment in a directory (mode 0700 on unix). Atomic writes via rename.
@@ -108,6 +161,21 @@ impl FileStore {
 
 #[async_trait::async_trait]
 impl Store for FileStore {
+    async fn migrate_legacy_policy(
+        &self,
+        id: &str,
+        version: u64,
+        budget: Option<crate::state::BuybackBudget>,
+    ) -> Result<PaymentRecord> {
+        let _g = self.lock.lock().map_err(store_err)?;
+        let path = self.path(id)?;
+        let previous = self
+            .read(&path)?
+            .ok_or_else(|| Error::NotFound(id.into()))?;
+        let next = migrated_policy(previous, version, budget)?;
+        self.write(&path, &next)?;
+        Ok(next)
+    }
     async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         let _g = self.lock.lock().map_err(store_err)?;
         let p = self.path(&rec.id)?;
@@ -239,6 +307,64 @@ impl Store for SqliteStore {
         self.reserve(signer, job, None)
     }
 
+    async fn cancel_preparation(&self, signer: &str, job: &str, token: &str) -> Result<()> {
+        let mut c = self.conn.lock().map_err(store_err)?;
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_err)?;
+        let removed = tx.execute(
+            "DELETE FROM signer_reservations WHERE signer=?1 AND job=?2 AND token=?3 AND NOT EXISTS (SELECT 1 FROM payments WHERE json_extract(record,'$.pending.signer')=?1 OR (id=?2 AND json_type(record,'$.pending')='object'))",
+            rusqlite::params![signer,job,token],
+        ).map_err(store_err)?;
+        if removed != 1 {
+            return Err(Error::Conflict(
+                "preparation token or pending journal changed".into(),
+            ));
+        }
+        tx.commit().map_err(store_err)
+    }
+    async fn migrate_legacy_policy(
+        &self,
+        id: &str,
+        version: u64,
+        budget: Option<crate::state::BuybackBudget>,
+    ) -> Result<PaymentRecord> {
+        let mut c = self.conn.lock().map_err(store_err)?;
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_err)?;
+        let reserved: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM signer_reservations WHERE job=?1)",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+        if reserved {
+            return Err(Error::Conflict("job has a signer reservation".into()));
+        }
+        let json: String = tx
+            .query_row("SELECT record FROM payments WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .map_err(store_err)?;
+        let next = migrated_policy(
+            serde_json::from_str(&json).map_err(store_err)?,
+            version,
+            budget,
+        )?;
+        tx.execute(
+            "UPDATE payments SET version=?1,record=?2 WHERE id=?3",
+            rusqlite::params![
+                i64::try_from(next.version).map_err(store_err)?,
+                serde_json::to_string(&next).map_err(store_err)?,
+                id
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(next)
+    }
     async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         let c = self.conn.lock().map_err(store_err)?;
         c.execute(
@@ -392,6 +518,17 @@ impl<S: Store + ?Sized> Store for Box<S> {
         (**self).reserve_signer(signer, job).await
     }
 
+    async fn cancel_preparation(&self, s: &str, j: &str, t: &str) -> Result<()> {
+        (**self).cancel_preparation(s, j, t).await
+    }
+    async fn migrate_legacy_policy(
+        &self,
+        id: &str,
+        v: u64,
+        b: Option<crate::state::BuybackBudget>,
+    ) -> Result<PaymentRecord> {
+        (**self).migrate_legacy_policy(id, v, b).await
+    }
     async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         (**self).insert(rec).await
     }
@@ -410,6 +547,159 @@ impl<S: Store + ?Sized> Store for Box<S> {
 mod tests {
     use super::*;
     use crate::state::test_record;
+
+    #[tokio::test]
+    async fn explicit_legacy_policy_migration_preserves_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = FileStore::open(dir.path()).unwrap();
+        #[allow(unused_mut)]
+        let mut stores: Vec<Box<dyn Store>> = vec![Box::new(file)];
+        #[cfg(feature = "sqlite")]
+        stores.push(Box::new(SqliteStore::in_memory().unwrap()));
+        for store in stores {
+            let mut legacy = test_record("legacy-policy");
+            legacy.auto_required = None;
+            store.insert(&legacy).await.unwrap();
+            assert!(
+                store
+                    .migrate_legacy_policy(&legacy.id, 1, None)
+                    .await
+                    .is_err()
+            );
+            let migrated = store
+                .migrate_legacy_policy(&legacy.id, 0, None)
+                .await
+                .unwrap();
+            assert_eq!(migrated.auto_required, Some(false));
+            assert_eq!(migrated.version, 1);
+            assert!(
+                store
+                    .migrate_legacy_policy(&legacy.id, 1, None)
+                    .await
+                    .is_err()
+            );
+            let mut evidence = legacy.clone();
+            evidence.id = "legacy-evidence".into();
+            evidence.funded_tao = 1;
+            store.insert(&evidence).await.unwrap();
+            assert!(
+                store
+                    .migrate_legacy_policy(&evidence.id, 0, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store.get(&evidence.id).await.unwrap().unwrap().funded_tao,
+                1
+            );
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn preparation_cancellation_requires_current_token_and_no_journal() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut rec = test_record("prepare-cancel");
+        rec.auto_required = None;
+        store.insert(&rec).await.unwrap();
+        let token = store
+            .reserve_signer_for_record("signer", &rec)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .migrate_legacy_policy(&rec.id, rec.version, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .cancel_preparation("signer", &rec.id, "wrong")
+                .await
+                .is_err()
+        );
+        store
+            .cancel_preparation("signer", &rec.id, &token)
+            .await
+            .unwrap();
+        let replacement = store
+            .reserve_signer_for_record("signer", &rec)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .cancel_preparation("signer", &rec.id, &token)
+                .await
+                .is_err()
+        );
+        rec.pending = Some(crate::chain::PendingTx {
+            action: crate::engine::Action::Fund,
+            reservation: Some(replacement.clone()),
+            signer: "signer".into(),
+            nonce: 0,
+            tx_hash: "hash".into(),
+            birth_block: 1,
+            amount: 1,
+        });
+        store.update(&rec).await.unwrap();
+        assert!(
+            store
+                .cancel_preparation("signer", &rec.id, &replacement)
+                .await
+                .is_err()
+        );
+        assert!(store.reserve_signer("signer", "other").await.is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn legacy_migration_fences_stale_reservers_and_freezes_validated_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("migration.sqlite");
+        let first = SqliteStore::open(&path).unwrap();
+        let second = SqliteStore::open(&path).unwrap();
+        let mut rec = test_record("legacy-budget");
+        rec.auto_required = None;
+        first.insert(&rec).await.unwrap();
+        let mut budget = crate::state::BuybackBudget {
+            amount_rao: 0,
+            currency: "TAO".into(),
+            source: "operator-allocation".into(),
+            netuid: 100,
+            destroy: crate::config::Destroy::Burn,
+            hotkey: crate::keys::ss58(
+                &crate::keys::keypair_from_uri("//Bob")
+                    .unwrap()
+                    .public_key()
+                    .to_account_id(),
+            ),
+        };
+        assert!(
+            first
+                .migrate_legacy_policy(&rec.id, 0, Some(budget.clone()))
+                .await
+                .is_err()
+        );
+        budget.amount_rao = crate::engine::MIN_STAKE_RAO;
+        let migrated = first
+            .migrate_legacy_policy(&rec.id, 0, Some(budget.clone()))
+            .await
+            .unwrap();
+        assert_eq!(migrated.auto_required, Some(true));
+        assert_eq!(
+            second.get(&rec.id).await.unwrap().unwrap().buyback_budget,
+            Some(budget)
+        );
+        assert!(
+            second
+                .reserve_signer_for_record("signer", &rec)
+                .await
+                .is_err()
+        );
+        let mut changed = migrated;
+        changed.buyback_budget = None;
+        assert!(second.update(&changed).await.is_err());
+    }
 
     async fn exercise(s: &dyn Store) {
         let r = test_record("p-1");
