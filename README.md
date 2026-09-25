@@ -369,6 +369,23 @@ policy, reservations, journals, receipts or other execution evidence refuse migr
 Ambiguous/partially executed legacy jobs still require manual chain reconciliation;
 never clear their evidence or overwrite a policy. FileStore migration does not enable signing.
 
+This is a blocked recovery path, not evidence that funds were lost. Records and receipts
+are preserved; rejection does not manufacture a persisted quarantine record.
+`TxRef` retains action, extrinsic/block hashes and amount, but not signer, nonce or
+full call targets/parameters. Those require authenticated finalized archive data.
+Neither chain history nor old receipts establish the original auto-buyback intent,
+capital source/allocation or destruction policy; mutable runtime defaults cannot recover
+that intent. Records also lack a genesis hash, and receipts alone cannot establish that
+no additional pre-journal action was emitted before a crash.
+
+Recovery therefore requires an audited operator manifest identifying network, signers,
+intended budget and steps, plus complete finalized extrinsics/events covering execution
+and any uncertain interval. An eventual importer must first dry-run hash, signer, nonce,
+target, amount and step checks, then apply a version-checked update without emitting any
+transaction or deleting evidence. No such importer exists here. Missing evidence means
+refusal, not automatic policy assignment, release or retry.
+
+
 SQLite reserves each signer exclusively before preparing a transaction. Reservation
 ownership is durable and has no lease expiry. The matching pending journal and its
 release are committed atomically after verified finality or complete mortality-window
@@ -383,8 +400,8 @@ independent stores are **not** protected. Namespace the database per chain.
 
 `FileStore` and custom `Store` implementations without durable reservations refuse
 engine signing. A PostgreSQL adapter must implement equivalent shared ownership and
-atomic journal release before enabling signing. Standalone operator methods remain
-unjournaled; never use them for automatic payment processing.
+atomic journal release before enabling signing. Standalone Engine buyback methods
+are disabled; raw Chain primitives have no durable ownership guarantee.
 
 Offline regressions drive the actual `Engine::tick` through funding, sweeping,
 purchase and burn, reopening the store and reconstructing the engine after every
