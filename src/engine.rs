@@ -609,9 +609,7 @@ impl<C: EngineRpc> Engine<C> {
         if required && r.buyback_done {
             validate_completed_buyback(r)?;
         }
-        if !r.buyback_done
-            && (r.buyback_budget.is_some() || matches!(self.cfg.auto, AutoBuyback::On { .. }))
-        {
+        if required && !r.buyback_done {
             return self.step_auto_buyback(r).await;
         }
         r.transition(PaymentState::Settled)?;
@@ -1817,6 +1815,63 @@ mod journal_rpc_tests {
             assert!(store.update(&bad).await.is_err());
             assert!(engine.step(bad, &Default::default()).await.is_err());
         }
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn persisted_auto_off_settles_after_runtime_enables_buyback() {
+        let treasury = PaymentWallet::generate().unwrap();
+        let rpc = Arc::new(SimulatedChain {
+            broadcasts: AtomicUsize::new(0),
+            hotkey: treasury.account_id(),
+            owner: Some(treasury.account_id()),
+            result: std::sync::Mutex::new(EventSummary::default()),
+        });
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let mut cfg = Config::new("unused", 100, treasury.account_id());
+        cfg.auto = AutoBuyback::Off;
+        cfg.consolidate = false;
+        cfg.return_dust = false;
+        let engine = Engine::new(
+            rpc.clone(),
+            store.clone(),
+            MasterKey::from_bytes([42; 32]),
+            treasury.keypair().clone(),
+            cfg.clone(),
+        );
+        let request = engine
+            .create_payment(CreatePayment::default())
+            .await
+            .unwrap();
+        let mut record = store.get(&request.id).await.unwrap().unwrap();
+        assert_eq!(record.auto_required, Some(false));
+        assert!(record.buyback_budget.is_none());
+        for state in [
+            PaymentState::Detected,
+            PaymentState::Funded,
+            PaymentState::Swept,
+        ] {
+            record.transition(state).unwrap();
+            record = store.update(&record).await.unwrap();
+        }
+        drop(engine);
+        cfg.auto = AutoBuyback::On {
+            destroy: Destroy::Burn,
+            amount: crate::AutoAmount::Fixed(MIN_STAKE_RAO),
+        };
+        let engine = Engine::new(
+            rpc.clone(),
+            store.clone(),
+            MasterKey::from_bytes([42; 32]),
+            treasury.keypair().clone(),
+            cfg,
+        );
+        assert_eq!(engine.tick().await.unwrap(), 1);
+        let settled = store.get(&request.id).await.unwrap().unwrap();
+        assert_eq!(settled.state, PaymentState::Settled);
+        assert!(settled.notified);
+        assert!(settled.buyback.is_none());
+        assert_eq!(settled.auto_required, Some(false));
         assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
     }
 
