@@ -17,7 +17,7 @@
 
 use crate::chain::{Chain, ChainCall, EventSummary, PendingOutcome, PendingTx};
 use crate::config::{AutoAmount, AutoBuyback, Config, Destroy};
-use crate::keys::{self, MasterKey, PaymentWallet};
+use crate::keys::{self, DerivationSeed, Keyring, PaymentWallet};
 use crate::state::{
     BuybackReceipt, PaymentRecord, PaymentRequest, PaymentState, PaymentStatus, TxRef, now,
 };
@@ -65,7 +65,9 @@ pub struct CreatePayment {
 pub struct Engine {
     chain: Chain,
     store: Arc<dyn Store>,
-    master: Arc<MasterKey>,
+    keyring: Arc<Keyring>,
+    /// Root of deterministic wallets; records with a `derivation_path` are opened from it.
+    seed: Option<Arc<DerivationSeed>>,
     treasury: Keypair,
     cfg: Config,
     treasury_lock: Mutex<()>,
@@ -78,14 +80,15 @@ impl Engine {
     pub fn new(
         chain: Chain,
         store: Arc<dyn Store>,
-        master: MasterKey,
+        keyring: impl Into<Keyring>,
         treasury: Keypair,
         cfg: Config,
     ) -> Self {
         Self {
             chain,
             store,
-            master: Arc::new(master),
+            keyring: Arc::new(keyring.into()),
+            seed: None,
             treasury,
             cfg,
             treasury_lock: Mutex::new(()),
@@ -93,6 +96,12 @@ impl Engine {
             #[cfg(feature = "webhook")]
             webhook: None,
         }
+    }
+
+    /// Open records that carry a `derivation_path` from this seed instead of their sealed copy.
+    pub fn with_seed(mut self, seed: Arc<DerivationSeed>) -> Self {
+        self.seed = Some(seed);
+        self
     }
 
     /// Sign webhook bodies with this secret (HMAC-SHA256, header `X-Buyback-Signature`).
@@ -122,11 +131,11 @@ impl Engine {
     // ------------------------------------------------------------------ requests
 
     /// Create a payment request backed by a brand-new wallet.
-    pub fn create_payment(&self, opts: CreatePayment) -> Result<PaymentRequest> {
+    pub async fn create_payment(&self, opts: CreatePayment) -> Result<PaymentRequest> {
         let wallet = PaymentWallet::generate()?;
         let id = uuid::Uuid::new_v4().to_string();
         let address = keys::ss58(&wallet.account_id());
-        let sealed = wallet.seal(&self.master, &keys::wallet_aad(&id, &address))?;
+        let sealed = wallet.seal_with(&self.keyring, &keys::wallet_aad(&id, &address))?;
         drop(wallet);
         let t = now();
         let rec = PaymentRecord {
@@ -159,8 +168,9 @@ impl Engine {
             buyback_done: false,
             notified: false,
             updated_at: t,
+            derivation_path: None,
         };
-        self.store.insert(&rec)?;
+        self.store.insert(&rec).await?;
         tracing::info!(id = %id, address = %address, "payment request created");
         Ok(PaymentRequest {
             id,
@@ -172,35 +182,103 @@ impl Engine {
         })
     }
 
-    pub fn status(&self, id: &str) -> Result<PaymentStatus> {
+    /// Sweep everything on `netuid` held by the deterministic wallet at `derivation_path` (a
+    /// permanent deposit address). The job starts in `detected`: the treasury funds fees, the
+    /// wallet `transfer_stake`s every position to the treasury, then consolidation, dust return
+    /// and the auto buyback run as for a payment. Each step is journaled, so a crash or a retry
+    /// never sends twice.
+    ///
+    /// `id` must be unique; the caller keeps at most one open job per address. Fails unless the
+    /// seed derives exactly `expected_address`.
+    pub async fn create_sweep_job(
+        &self,
+        id: &str,
+        derivation_path: &str,
+        expected_address: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<PaymentStatus> {
+        let seed = self
+            .seed
+            .as_ref()
+            .ok_or_else(|| Error::Config("sweep jobs need a derivation seed".into()))?;
+        let wallet = seed.wallet(derivation_path)?;
+        let address = keys::ss58(&wallet.account_id());
+        if address != expected_address {
+            return Err(Error::Crypto("derived address does not match the expected one".into()));
+        }
+        // A sealed copy is kept as well; the seed stays authoritative.
+        let sealed = wallet.seal_with(&self.keyring, &keys::wallet_aad(id, &address))?;
+        drop(wallet);
+        let t = now();
+        let rec = PaymentRecord {
+            id: id.into(),
+            address,
+            netuid: self.cfg.netuid,
+            min_alpha: 0,
+            min_tao: None,
+            created_at: t,
+            expires_at: u64::MAX,
+            state: PaymentState::Detected,
+            version: 0,
+            sealed_secret: sealed,
+            metadata,
+            callback_url: None,
+            detected_alpha: 0,
+            detected_tao: 0,
+            funded_tao: 0,
+            swept_alpha: 0,
+            txs: vec![],
+            buyback: None,
+            attempts: 0,
+            next_attempt_at: 0,
+            last_error: None,
+            failed_from: None,
+            pending: None,
+            swept_positions: vec![],
+            consolidated: 0,
+            dust_returned: false,
+            buyback_done: false,
+            notified: false,
+            updated_at: t,
+            derivation_path: Some(derivation_path.into()),
+        };
+        self.store.insert(&rec).await?;
+        tracing::info!(id, address = %rec.address, "sweep job created");
+        Ok(rec.status())
+    }
+
+    pub async fn status(&self, id: &str) -> Result<PaymentStatus> {
         self.store
-            .get(id)?
+            .get(id)
+            .await?
             .map(|r| r.status())
             .ok_or_else(|| Error::NotFound(id.into()))
     }
 
     /// Resume a `failed` payment from the step it failed in.
-    pub fn retry(&self, id: &str) -> Result<PaymentStatus> {
+    pub async fn retry(&self, id: &str) -> Result<PaymentStatus> {
         let mut r = self
             .store
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| Error::NotFound(id.into()))?;
         let to = match r.failed_from {
             Some(PaymentState::Pending) | None => PaymentState::Detected,
             Some(s) => s,
         };
         r.transition(to)?;
-        Ok(self.store.update(&r)?.status())
+        Ok(self.store.update(&r).await?.status())
     }
 
     /// Sweep an `expired` payment that received less than the minimum.
-    pub fn force_sweep(&self, id: &str) -> Result<PaymentStatus> {
+    pub async fn force_sweep(&self, id: &str) -> Result<PaymentStatus> {
         let mut r = self
             .store
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| Error::NotFound(id.into()))?;
         r.transition(PaymentState::Detected)?;
-        Ok(self.store.update(&r)?.status())
+        Ok(self.store.update(&r).await?.status())
     }
 
     // ------------------------------------------------------------------ driver
@@ -237,7 +315,8 @@ impl Engine {
         use PaymentState::*;
         let recs = self
             .store
-            .list(&[Pending, Detected, Funded, Swept, Settled])?;
+            .list(&[Pending, Detected, Funded, Swept, Settled])
+            .await?;
         let t = now();
         let mut n = 0;
         // Batch the balance reads of pending payments into one runtime-API call.
@@ -290,10 +369,11 @@ impl Engine {
                 // Re-read: the journaling write may have bumped the version.
                 let mut cur = self
                     .store
-                    .get(&r.id)?
+                    .get(&r.id)
+                    .await?
                     .ok_or_else(|| Error::NotFound(r.id.clone()))?;
                 cur.record_failure(&e.to_string(), self.cfg.max_attempts, now());
-                let cur = self.store.update(&cur)?;
+                let cur = self.store.update(&cur).await?;
                 self.announce_if_final(&cur);
                 Err(e)
             }
@@ -326,13 +406,13 @@ impl Engine {
             r.detected_tao = if tao_ok { tao } else { 0 };
             r.transition(PaymentState::Detected)?;
             tracing::info!(id = %r.id, alpha, tao, "payment detected");
-            self.store.update(&r)?;
+            self.store.update(&r).await?;
             return Ok(true);
         }
         if now() > r.expires_at {
             r.detected_alpha = alpha;
             r.transition(PaymentState::Expired)?;
-            let r = self.store.update(&r)?;
+            let r = self.store.update(&r).await?;
             self.announce_if_final(&r);
             return Ok(true);
         }
@@ -367,7 +447,7 @@ impl Engine {
         };
         if need == 0 {
             r.transition(PaymentState::Funded)?;
-            *r = self.store.update(r)?;
+            *r = self.store.update(r).await?;
             return Ok(true);
         }
         let call = ChainCall::TransferTao {
@@ -392,7 +472,7 @@ impl Engine {
             .find(|p| p.alpha >= floor && !done.contains(&keys::ss58(&p.hotkey).as_str()))
         else {
             r.transition(PaymentState::Swept)?;
-            *r = self.store.update(r)?;
+            *r = self.store.update(r).await?;
             tracing::info!(id = %r.id, alpha = r.swept_alpha, "swept");
             return Ok(true);
         };
@@ -422,7 +502,7 @@ impl Engine {
                 };
                 if live == 0 {
                     r.consolidated += 1;
-                    *r = self.store.update(r)?;
+                    *r = self.store.update(r).await?;
                     continue;
                 }
                 let call = ChainCall::MoveStake {
@@ -462,7 +542,7 @@ impl Engine {
             return self.step_auto_buyback(r, destroy, amount).await;
         }
         r.transition(PaymentState::Settled)?;
-        *r = self.store.update(r)?;
+        *r = self.store.update(r).await?;
         tracing::info!(id = %r.id, "settled");
         let rec = r.clone();
         self.notify(rec).await?;
@@ -480,7 +560,7 @@ impl Engine {
         if let Some(b) = &r.buyback {
             if destroy == Destroy::Keep || b.destroy_tx.is_some() || b.alpha_bought == 0 {
                 r.buyback_done = true;
-                *r = self.store.update(r)?;
+                *r = self.store.update(r).await?;
                 return Ok(true);
             }
             let call = destroy_call(destroy, self.cfg.treasury_hotkey, netuid, b.alpha_bought);
@@ -507,7 +587,7 @@ impl Engine {
         if tao < MIN_STAKE_RAO {
             tracing::warn!(id = %r.id, tao, "auto buyback skipped: amount below minimum stake");
             r.buyback_done = true;
-            *r = self.store.update(r)?;
+            *r = self.store.update(r).await?;
             return Ok(true);
         }
         let limit_price =
@@ -549,32 +629,21 @@ impl Engine {
         call: &ChainCall,
         signer: &Keypair,
     ) -> Result<bool> {
-        let signer_ss58 = keys::ss58(&signer.public_key().to_account_id());
-        let store = &self.store;
-        let amount = call.amount();
-        let mut journaled: Option<PaymentRecord> = None;
-        let res = self
-            .chain
-            .submit(call, signer, |nonce, tx_hash, birth_block| {
-                let mut j = r.clone();
-                j.pending = Some(PendingTx {
-                    action: action.clone(),
-                    signer: signer_ss58.clone(),
-                    nonce,
-                    tx_hash: tx_hash.into(),
-                    birth_block,
-                    amount,
-                });
-                journaled = Some(store.update(&j)?);
-                Ok(())
-            })
-            .await;
-        if let Some(j) = journaled {
-            *r = j;
-        }
-        let ftx = res?;
+        let prepared = self.chain.prepare(call, signer).await?;
+        let mut j = r.clone();
+        j.pending = Some(PendingTx {
+            action,
+            signer: prepared.signer.clone(),
+            nonce: prepared.nonce,
+            tx_hash: prepared.tx_hash.clone(),
+            birth_block: prepared.birth_block,
+            amount: call.amount(),
+        });
+        // Journal before broadcast: a lost race or a failed write sends nothing.
+        *r = self.store.update(&j).await?;
+        let ftx = self.chain.broadcast(&prepared).await?;
         self.apply(r, ftx.tx, &ftx.summary)?;
-        *r = self.store.update(r)?;
+        *r = self.store.update(r).await?;
         Ok(true)
     }
 
@@ -585,7 +654,7 @@ impl Engine {
             PendingOutcome::Dead => {
                 tracing::warn!(id = %r.id, tx = %p.tx_hash, "journaled tx expired unincluded; rebuilding step");
                 r.pending = None;
-                self.store.update(&r)?;
+                self.store.update(&r).await?;
                 Ok(true)
             }
             PendingOutcome::Included {
@@ -608,7 +677,7 @@ impl Engine {
                 } else {
                     self.apply(&mut r, tx, &summary)?;
                 }
-                let r = self.store.update(&r)?;
+                let r = self.store.update(&r).await?;
                 self.announce_if_final(&r);
                 Ok(true)
             }
@@ -669,11 +738,14 @@ impl Engine {
     }
 
     fn wallet(&self, r: &PaymentRecord) -> Result<PaymentWallet> {
-        let w = PaymentWallet::unseal(
-            &self.master,
-            &r.sealed_secret,
-            &keys::wallet_aad(&r.id, &r.address),
-        )?;
+        let w = match (&r.derivation_path, &self.seed) {
+            (Some(path), Some(seed)) => seed.wallet(path)?,
+            _ => PaymentWallet::unseal_with(
+                &self.keyring,
+                &r.sealed_secret,
+                &keys::wallet_aad(&r.id, &r.address),
+            )?,
+        };
         if keys::ss58(&w.account_id()) != r.address {
             return Err(Error::Crypto("sealed wallet does not match address".into()));
         }
@@ -696,12 +768,12 @@ impl Engine {
             tracing::warn!(id = %r.id, error = %e, "webhook failed; will retry");
             let mut cur = r;
             cur.next_attempt_at = now() + 30;
-            self.store.update(&cur)?;
+            self.store.update(&cur).await?;
             return Ok(());
         }
         let mut cur = r;
         cur.notified = true;
-        self.store.update(&cur)?;
+        self.store.update(&cur).await?;
         Ok(())
     }
 
@@ -723,9 +795,7 @@ impl Engine {
             None => {
                 let _g = self.treasury_lock.lock().await;
                 let call = ChainCall::AssociateHotkey { hotkey: *hk };
-                self.chain
-                    .submit(&call, &self.treasury, |_, _, _| Ok(()))
-                    .await?;
+                self.chain.submit(&call, &self.treasury).await?;
                 tracing::info!(hotkey = %keys::ss58(hk), "treasury hotkey associated");
                 Ok(())
             }
@@ -790,7 +860,7 @@ impl Engine {
         };
         let f = self
             .chain
-            .submit(&buy, &self.treasury, |_, _, _| Ok(()))
+            .submit(&buy, &self.treasury)
             .await?;
         let (tao_spent, alpha_bought) = f
             .summary
@@ -809,7 +879,7 @@ impl Engine {
             let call = destroy_call(destroy, hotkey, netuid, alpha_bought);
             let d = self
                 .chain
-                .submit(&call, &self.treasury, |_, _, _| Ok(()))
+                .submit(&call, &self.treasury)
                 .await?;
             receipt.alpha_destroyed = d
                 .summary

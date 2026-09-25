@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     ));
     engine.ensure_treasury_hotkey().await?;
 
-    let req = engine.create_payment(CreatePayment::default())?;
+    let req = engine.create_payment(CreatePayment::default()).await?;
     println!(
         "send >= {} alpha on netuid {} to {} (transfer_stake)",
         units::format_amount(req.min_alpha),

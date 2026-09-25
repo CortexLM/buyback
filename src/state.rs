@@ -127,6 +127,10 @@ pub struct PaymentRecord {
     pub buyback_done: bool,
     pub notified: bool,
     pub updated_at: u64,
+    /// Hard derivation path of a deterministic wallet (`//opentype//deposit//7`). When set the
+    /// engine derives the key from its seed; `sealed_secret` is a backup copy.
+    #[serde(default)]
+    pub derivation_path: Option<String>,
 }
 
 impl PaymentRecord {
@@ -247,6 +251,7 @@ pub(crate) fn test_record(id: &str) -> PaymentRecord {
             v: 1,
             nonce: "00".into(),
             ct: "00".into(),
+            kid: None,
         },
         metadata: None,
         callback_url: None,
@@ -267,6 +272,7 @@ pub(crate) fn test_record(id: &str) -> PaymentRecord {
         buyback_done: false,
         notified: false,
         updated_at: 0,
+        derivation_path: None,
     }
 }
 

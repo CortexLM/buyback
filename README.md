@@ -105,6 +105,32 @@ it, starts a new engine on the same store, and asserts the payment settles with 
 Standalone `buyback*()` calls are *not* journaled. They are operator actions. If one errors,
 check `buyback balances` before running it again.
 
+## Static deposit addresses
+
+For "one permanent address per account" integrations, wallets are derived instead of generated:
+
+- `DerivationSeed::from_phrase(mnemonic)` holds the master seed (from secret config, never stored).
+  `seed.wallet("//app//deposit//<index>")` does sr25519 HDKD with hard junctions only (soft or
+  malformed paths are refused). The same mnemonic and index always give the same key, so every
+  address can be rebuilt from the mnemonic plus the index range after total data loss.
+- `Chain::deposits_in_block(number, &watched)` returns every `StakeAdded` that landed on a watched
+  coldkey in a successful signed extrinsic, with `(block_hash, event_index)` as a natural
+  idempotency key, the signer, and the block's spot and moving price.
+- `Engine::with_seed(seed).create_sweep_job(id, path, expected_address, meta)` re-derives the wallet,
+  refuses a mismatching address, and runs the usual fund / sweep / consolidate / buyback state
+  machine. Alpha emitted after a sweep stays as dust and is picked up by the next job.
+
+Sealed secrets carry a key id: `Keyring::parse("k1:<hex>,k2:<hex>", "k2")` opens either key and
+seals with the active one; `Keyring::reseal` rotates a stored secret.
+
+## RPC endpoints and auth
+
+`Endpoint::new(url).with_bearer(key)` sends `Authorization: Bearer <key>` on the WebSocket
+handshake (the key is redacted in `Debug` and in errors). `Chain::connect_any(&endpoints, attempts)`
+tries each endpoint in order with backoff. Plaintext `ws://` is refused except on loopback.
+Read-only probe: `BITTENSOR_RPC_URL=wss://... BITTENSOR_RPC_API_KEY=... cargo run --example
+verify_metadata -- finney 100`.
+
 ## Library API
 
 ```rust,no_run

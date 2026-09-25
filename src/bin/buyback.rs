@@ -278,11 +278,12 @@ async fn main() -> R<()> {
                 metadata,
                 callback_url,
                 ..Default::default()
-            })?)?;
+            })
+            .await?)?;
         }
-        Cmd::Status { c, id } => print(&engine(&c).await?.status(&id)?)?,
-        Cmd::Retry { c, id } => print(&engine(&c).await?.retry(&id)?)?,
-        Cmd::ForceSweep { c, id } => print(&engine(&c).await?.force_sweep(&id)?)?,
+        Cmd::Status { c, id } => print(&engine(&c).await?.status(&id).await?)?,
+        Cmd::Retry { c, id } => print(&engine(&c).await?.retry(&id).await?)?,
+        Cmd::ForceSweep { c, id } => print(&engine(&c).await?.force_sweep(&id).await?)?,
         Cmd::Run { c, listen } => {
             let e = Arc::new(engine(&c).await?);
             for line in e.chain().verify_metadata().await? {

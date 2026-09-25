@@ -8,15 +8,17 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Async so a database-backed store (e.g. PostgreSQL) can implement it directly.
+#[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
     /// Insert a new record (version 0). Fails if the id exists.
-    fn insert(&self, rec: &PaymentRecord) -> Result<()>;
-    fn get(&self, id: &str) -> Result<Option<PaymentRecord>>;
+    async fn insert(&self, rec: &PaymentRecord) -> Result<()>;
+    async fn get(&self, id: &str) -> Result<Option<PaymentRecord>>;
     /// Records in the given states.
-    fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>>;
+    async fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>>;
     /// Write `rec` if the stored version equals `rec.version`; returns the record with its new
     /// version. [`Error::Conflict`] otherwise.
-    fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord>;
+    async fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord>;
 }
 
 fn store_err(e: impl std::fmt::Display) -> Error {
@@ -78,8 +80,9 @@ impl FileStore {
     }
 }
 
+#[async_trait::async_trait]
 impl Store for FileStore {
-    fn insert(&self, rec: &PaymentRecord) -> Result<()> {
+    async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         let _g = self.lock.lock().map_err(store_err)?;
         let p = self.path(&rec.id)?;
         if p.exists() {
@@ -88,11 +91,11 @@ impl Store for FileStore {
         self.write(&p, rec)
     }
 
-    fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
+    async fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
         self.read(&self.path(id)?)
     }
 
-    fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
+    async fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
         let mut out = vec![];
         for e in std::fs::read_dir(&self.dir).map_err(store_err)? {
             let p = e.map_err(store_err)?.path();
@@ -107,7 +110,7 @@ impl Store for FileStore {
         Ok(out)
     }
 
-    fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
+    async fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
         let _g = self.lock.lock().map_err(store_err)?;
         let p = self.path(&rec.id)?;
         let cur = self
@@ -157,8 +160,9 @@ impl SqliteStore {
 }
 
 #[cfg(feature = "sqlite")]
+#[async_trait::async_trait]
 impl Store for SqliteStore {
-    fn insert(&self, rec: &PaymentRecord) -> Result<()> {
+    async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         let c = self.conn.lock().map_err(store_err)?;
         c.execute(
             "INSERT INTO payments (id, state, version, created_at, record) VALUES (?1,?2,?3,?4,?5)",
@@ -174,7 +178,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
+    async fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
         let c = self.conn.lock().map_err(store_err)?;
         let mut st = c
             .prepare("SELECT record FROM payments WHERE id = ?1")
@@ -189,7 +193,7 @@ impl Store for SqliteStore {
         }
     }
 
-    fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
+    async fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
         let c = self.conn.lock().map_err(store_err)?;
         let mut st = c
             .prepare("SELECT record, state FROM payments ORDER BY created_at")
@@ -208,7 +212,7 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
-    fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
+    async fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
         let c = self.conn.lock().map_err(store_err)?;
         let mut next = rec.clone();
         next.version += 1;
@@ -258,18 +262,19 @@ pub fn open_store(spec: &str) -> Result<Box<dyn Store>> {
     ))
 }
 
+#[async_trait::async_trait]
 impl<S: Store + ?Sized> Store for Box<S> {
-    fn insert(&self, rec: &PaymentRecord) -> Result<()> {
-        (**self).insert(rec)
+    async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
+        (**self).insert(rec).await
     }
-    fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
-        (**self).get(id)
+    async fn get(&self, id: &str) -> Result<Option<PaymentRecord>> {
+        (**self).get(id).await
     }
-    fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
-        (**self).list(states)
+    async fn list(&self, states: &[PaymentState]) -> Result<Vec<PaymentRecord>> {
+        (**self).list(states).await
     }
-    fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
-        (**self).update(rec)
+    async fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
+        (**self).update(rec).await
     }
 }
 
@@ -278,54 +283,54 @@ mod tests {
     use super::*;
     use crate::state::test_record;
 
-    fn exercise(s: &dyn Store) {
+    async fn exercise(s: &dyn Store) {
         let r = test_record("p-1");
-        s.insert(&r).unwrap();
-        assert!(s.insert(&r).is_err(), "duplicate insert");
-        let mut got = s.get("p-1").unwrap().unwrap();
+        s.insert(&r).await.unwrap();
+        assert!(s.insert(&r).await.is_err(), "duplicate insert");
+        let mut got = s.get("p-1").await.unwrap().unwrap();
         assert_eq!(got.version, 0);
         got.transition(PaymentState::Detected).unwrap();
-        let v1 = s.update(&got).unwrap();
+        let v1 = s.update(&got).await.unwrap();
         assert_eq!(v1.version, 1);
         // stale writer loses
-        assert!(matches!(s.update(&got), Err(Error::Conflict(_))));
-        assert_eq!(s.get("p-1").unwrap().unwrap().state, PaymentState::Detected);
-        s.insert(&test_record("p-2")).unwrap();
-        assert_eq!(s.list(&[PaymentState::Pending]).unwrap().len(), 1);
+        assert!(matches!(s.update(&got).await, Err(Error::Conflict(_))));
+        assert_eq!(s.get("p-1").await.unwrap().unwrap().state, PaymentState::Detected);
+        s.insert(&test_record("p-2")).await.unwrap();
+        assert_eq!(s.list(&[PaymentState::Pending]).await.unwrap().len(), 1);
         assert_eq!(
-            s.list(&[PaymentState::Pending, PaymentState::Detected])
+            s.list(&[PaymentState::Pending, PaymentState::Detected]).await
                 .unwrap()
                 .len(),
             2
         );
-        assert!(s.get("nope").unwrap().is_none());
+        assert!(s.get("nope").await.unwrap().is_none());
         let mut ghost = test_record("ghost");
         ghost.version = 0;
-        assert!(matches!(s.update(&ghost), Err(Error::NotFound(_))));
+        assert!(matches!(s.update(&ghost).await, Err(Error::NotFound(_))));
     }
 
-    #[test]
-    fn file_store() {
+    #[tokio::test]
+    async fn file_store() {
         let d = tempfile::tempdir().unwrap();
         let s = FileStore::open(d.path()).unwrap();
-        exercise(&s);
-        assert!(s.get("../etc/passwd").is_err());
+        exercise(&s).await;
+        assert!(s.get("../etc/passwd").await.is_err());
         // survives reopen (restart)
         let s2 = FileStore::open(d.path()).unwrap();
-        assert_eq!(s2.get("p-1").unwrap().unwrap().version, 1);
+        assert_eq!(s2.get("p-1").await.unwrap().unwrap().version, 1);
     }
 
     #[cfg(feature = "sqlite")]
-    #[test]
-    fn sqlite_store() {
-        exercise(&SqliteStore::in_memory().unwrap());
+    #[tokio::test]
+    async fn sqlite_store() {
+        exercise(&SqliteStore::in_memory().unwrap()).await;
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("db.sqlite");
-        exercise(&SqliteStore::open(&path).unwrap());
+        exercise(&SqliteStore::open(&path).unwrap()).await;
         assert_eq!(
             SqliteStore::open(&path)
                 .unwrap()
-                .get("p-1")
+                .get("p-1").await
                 .unwrap()
                 .unwrap()
                 .version,

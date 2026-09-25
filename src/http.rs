@@ -25,14 +25,14 @@ pub fn router(engine: Arc<Engine>) -> Router {
 
 async fn create(State(e): State<Arc<Engine>>, body: Option<Json<CreatePayment>>) -> Response {
     let opts = body.map(|Json(b)| b).unwrap_or_default();
-    match e.create_payment(opts) {
+    match e.create_payment(opts).await {
         Ok(req) => (StatusCode::CREATED, Json(req)).into_response(),
         Err(err) => error(err),
     }
 }
 
 async fn status(State(e): State<Arc<Engine>>, Path(id): Path<String>) -> Response {
-    match e.status(&id) {
+    match e.status(&id).await {
         Ok(s) => Json(s).into_response(),
         Err(err) => error(err),
     }

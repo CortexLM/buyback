@@ -558,6 +558,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 name = "bittensor-buyback"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bip39",
  "chacha20poly1305",
@@ -565,12 +566,15 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.12.1",
+ "jsonrpsee",
  "parity-scale-codec",
+ "pbkdf2",
  "rand_core 0.6.4",
  "reqwest",
  "rusqlite",
  "scale-decode",
  "scale-value",
+ "schnorrkel",
  "serde",
  "serde_json",
  "sha2 0.10.9",
