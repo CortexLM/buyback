@@ -18,6 +18,10 @@ use subxt::dynamic::{self, Value};
 use subxt::utils::AccountId32;
 use subxt_signer::sr25519::Keypair;
 
+// ponytail: these fixtures share Alice and global subnet registration state;
+// serialize this test binary until each fixture has an isolated local chain.
+static LOCALNET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn url() -> String {
     std::env::var("BUYBACK_LOCALNET_URL").unwrap_or_else(|_| "ws://127.0.0.1:9944".into())
 }
@@ -88,6 +92,7 @@ async fn new_subnet(chain: &Chain, owner: &Keypair, hotkey: &Keypair, env: &str)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_flow() {
+    let _chain_guard = LOCALNET.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,bittensor_buyback=debug")
         .try_init();
@@ -440,6 +445,7 @@ async fn full_flow() {
 /// treasury and burns a buyback.
 #[tokio::test(flavor = "multi_thread")]
 async fn static_address_scan_and_sweep() {
+    let _chain_guard = LOCALNET.lock().await;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("info,bittensor_buyback=debug")
         .try_init();
