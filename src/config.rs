@@ -72,6 +72,8 @@ pub struct Config {
     /// Let `add_stake_limit` fill partially up to the limit price instead of failing.
     pub allow_partial: bool,
     pub auto: AutoBuyback,
+    /// Required explicit additional capital for automatic jobs; frozen at creation.
+    pub buyback_budget: Option<crate::state::BuybackBudget>,
     /// Attempts per step before a payment goes to `failed`.
     pub max_attempts: u32,
     /// Default webhook for settled payments (per-request `callback_url` overrides).
@@ -97,6 +99,7 @@ impl Config {
             slippage_bps: 100,
             allow_partial: false,
             auto: AutoBuyback::Off,
+            buyback_budget: None,
             max_attempts: 8,
             webhook_url: None,
         }

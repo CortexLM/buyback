@@ -76,9 +76,12 @@ struct Common {
     /// Automatic buyback per settled payment: off | keep | burn | recycle
     #[arg(long, env = "BUYBACK_AUTO", default_value = "off")]
     auto: String,
-    /// Auto amount: all, payment, or a TAO amount
+    /// Fixed additional TAO allocation per new job; required when auto is enabled
     #[arg(long, env = "BUYBACK_AUTO_AMOUNT", default_value = "payment")]
     auto_amount: String,
+    /// Operator allocation reference for additional treasury capital
+    #[arg(long, env = "BUYBACK_AUTO_SOURCE")]
+    auto_source: Option<String>,
     /// Default settlement webhook
     #[arg(long, env = "BUYBACK_WEBHOOK_URL")]
     webhook_url: Option<String>,
@@ -198,17 +201,27 @@ async fn engine(c: &Common) -> R<Engine> {
     cfg.fee_margin_bps = c.fee_margin_bps;
     cfg.fee_reserve = units::parse_amount(&c.fee_reserve)?;
     cfg.webhook_url = c.webhook_url.clone();
-    cfg.auto = match c.auto.as_str() {
-        "off" => AutoBuyback::Off,
-        d => AutoBuyback::On {
-            destroy: destroy(d)?,
-            amount: match c.auto_amount.as_str() {
-                "all" => AutoAmount::All,
-                "payment" => AutoAmount::PaymentValueBps(10_000),
-                a => AutoAmount::Fixed(units::parse_amount(a)?),
-            },
-        },
-    };
+    if c.auto != "off" {
+        let amount = units::parse_amount(&c.auto_amount)?;
+        let destroy = destroy(&c.auto)?;
+        let budget = bittensor_buyback::state::BuybackBudget {
+            amount_rao: amount,
+            currency: "TAO".into(),
+            hotkey: c.treasury_hotkey.clone(),
+            source: c
+                .auto_source
+                .clone()
+                .ok_or("--auto-source required for automatic buyback")?,
+            netuid: c.buyback_netuid,
+            destroy,
+        };
+        budget.validate()?;
+        cfg.buyback_budget = Some(budget);
+        cfg.auto = AutoBuyback::On {
+            destroy,
+            amount: AutoAmount::Fixed(amount),
+        };
+    }
     let chain = Chain::connect(net.url()).await?;
     let store: Arc<dyn bittensor_buyback::Store> = Arc::from(open_store(&c.store)?);
     #[allow(unused_mut)]

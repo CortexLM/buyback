@@ -134,6 +134,14 @@ async fn full_flow() {
         destroy: Destroy::Burn,
         amount: AutoAmount::Fixed(RAO_PER_TAO / 2),
     };
+    cfg.buyback_budget = Some(bittensor_buyback::state::BuybackBudget {
+        amount_rao: RAO_PER_TAO / 2,
+        currency: "TAO".into(),
+        source: "localnet-test-allocation".into(),
+        hotkey: keys::ss58(&id(&treasury_hk)),
+        netuid: buy_net,
+        destroy: Destroy::Burn,
+    });
     let master_hex = MasterKey::generate().to_hex();
     let engine = Arc::new(Engine::new(
         chain.clone(),
@@ -318,6 +326,10 @@ async fn full_flow() {
         PaymentState::Detected
     );
     let fee_tao = RAO_PER_TAO / 100;
+    let reservation = store
+        .reserve_signer(&keys::ss58(&id(&treasury)), &req2.id)
+        .await
+        .unwrap();
     let prepared = chain
         .prepare(
             &ChainCall::TransferTao {
@@ -329,6 +341,7 @@ async fn full_flow() {
         .await
         .unwrap();
     let journal = Some(bittensor_buyback::chain::PendingTx {
+        reservation: Some(reservation),
         action: Action::Fund,
         signer: keys::ss58(&id(&treasury)),
         nonce: prepared.nonce,
@@ -336,10 +349,10 @@ async fn full_flow() {
         birth_block: prepared.birth_block,
         amount: fee_tao,
     });
-    chain.broadcast(&prepared).await.unwrap();
     let mut rec = store.get(&req2.id).await.unwrap().unwrap();
     rec.pending = journal;
     store.update(&rec).await.unwrap();
+    chain.broadcast(&prepared).await.unwrap();
     let engine2 = Arc::new(Engine::new(
         chain.clone(),
         store.clone(),
@@ -546,6 +559,14 @@ async fn static_address_scan_and_sweep() {
         destroy: Destroy::Burn,
         amount: AutoAmount::Fixed(RAO_PER_TAO / 4),
     };
+    cfg.buyback_budget = Some(bittensor_buyback::state::BuybackBudget {
+        amount_rao: RAO_PER_TAO / 4,
+        currency: "TAO".into(),
+        source: "localnet-test-allocation".into(),
+        hotkey: keys::ss58(&id(&treasury_hk)),
+        netuid: buy_net,
+        destroy: Destroy::Burn,
+    });
     let engine = Engine::new(
         chain.clone(),
         store.clone(),

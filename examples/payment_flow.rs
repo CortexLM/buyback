@@ -18,13 +18,21 @@ async fn main() -> Result<()> {
 
     let chain = Chain::connect(&url).await?;
     chain.verify_metadata().await?;
-    let store: Arc<dyn Store> = Arc::new(FileStore::open("./payments")?);
+    let store: Arc<dyn Store> = Arc::from(open_store("sqlite:payments.sqlite")?);
     let treasury = TreasuryKeySource::EnvUri("BUYBACK_TREASURY_URI".into()).load(None)?;
     let mut cfg = Config::new(url, netuid, hotkey);
-    cfg.auto = AutoBuyback::On {
+    cfg.buyback_budget = Some(state::BuybackBudget {
+        amount_rao: units::parse_amount(
+            &std::env::var("BUYBACK_AUTO_AMOUNT")
+                .map_err(|_| Error::Config("BUYBACK_AUTO_AMOUNT required".into()))?,
+        )?,
+        currency: "TAO".into(),
+        source: std::env::var("BUYBACK_AUTO_SOURCE")
+            .map_err(|_| Error::Config("BUYBACK_AUTO_SOURCE required".into()))?,
+        netuid: 100,
         destroy: Destroy::Burn,
-        amount: AutoAmount::PaymentValueBps(10_000),
-    };
+        hotkey: keys::ss58(&hotkey),
+    });
     let engine = Arc::new(Engine::new(
         chain,
         store,

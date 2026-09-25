@@ -144,12 +144,16 @@ let master = MasterKey::from_env("BUYBACK_MASTER_KEY")?;
 let treasury = TreasuryKeySource::EncryptedKeystore("treasury.json".into()).load(Some(&master))?;
 let mut cfg = Config::new(Network::Finney.url(), 42 /* payment netuid */,
                           keys::parse_ss58("5...treasury hotkey")?);
-cfg.auto = AutoBuyback::On { destroy: Destroy::Burn, amount: AutoAmount::PaymentValueBps(10_000) };
+cfg.buyback_budget = Some(state::BuybackBudget {
+    amount_rao: units::parse_amount("0.5")?, currency: "TAO".into(),
+    source: "approved-working-capital".into(), netuid: 100, destroy: Destroy::Burn,
+    hotkey: keys::ss58(&cfg.treasury_hotkey),
+});
 let engine = Arc::new(Engine::new(chain, store, master, treasury, cfg));
 engine.ensure_treasury_hotkey().await?;               // try_associate_hotkey if missing
 
-let req: PaymentRequest = engine.create_payment(CreatePayment::default())?;
-let status: PaymentStatus = engine.status(&req.id)?;
+let req: PaymentRequest = engine.create_payment(CreatePayment::default()).await?;
+let status: PaymentStatus = engine.status(&req.id).await?;
 let mut settled = engine.subscribe();                 // in-process callback
 tokio::spawn({ let e = engine.clone(); async move { e.run().await } });
 
@@ -227,7 +231,7 @@ receivers must deduplicate on `id`.
 | `buyback_netuid` | `BUYBACK_NETUID_TARGET` | **100** | |
 | `slippage_bps` | `BUYBACK_SLIPPAGE_BPS` | 100 (1 %) | `limit_price = spot * (1 + bps/1e4)` |
 | `allow_partial` | - | false | fill-or-kill by default |
-| `auto` | `BUYBACK_AUTO` / `BUYBACK_AUTO_AMOUNT` | off | `keep`/`burn`/`recycle` x `all` / `payment` (spot value of the swept alpha) / fixed amount |
+| `auto` | `BUYBACK_AUTO` / `BUYBACK_AUTO_AMOUNT` | off | `keep`/`burn`/`recycle` with fixed TAO amount and `BUYBACK_AUTO_SOURCE` |
 | `max_attempts` | - | 8 | |
 
 Treasury coldkey sources (`TreasuryKeySource`): `EnvUri` (mnemonic or secret URI in an env var),
@@ -347,3 +351,35 @@ against the localnet image as a service container.
 MIT OR Apache-2.0.
 
 [`subxt`]: https://github.com/paritytech/subxt
+
+### Strict automatic jobs and shared signer ownership
+
+Automatic jobs now require `Config.buyback_budget`: an explicit `BuybackBudget`
+with `amount_rao`, `currency="TAO"`, nonempty allocation `source`, target `netuid`,
+and `destroy`. This is additional treasury capital, not a sale of deposited alpha.
+The budget is frozen at job creation; stores reject later modifications. Missing
+budgets, insufficient capital, zero purchases, partial spends, and incomplete burns
+block completion. Legacy dynamic `AutoAmount` values do not allocate job capital.
+CLI automatic mode requires a numeric `--auto-amount` and `--auto-source`.
+Existing jobs without budgets require explicit migration/review, not runtime defaults.
+
+SQLite reserves each signer exclusively before preparing a transaction. Reservation
+ownership is durable and has no lease expiry. The matching pending journal and its
+release are committed atomically after verified finality or complete mortality-window
+absence. A crash before journaling leaves an orphan reservation: signing remains
+blocked pending explicit operator reconciliation; there is no automatic unlock API.
+Use one shared SQLite database on a filesystem supporting SQLite locking. Different
+database files, unrelated applications using the same key, and separate hosts with
+independent stores are **not** protected. Namespace the database per chain.
+
+`FileStore` and custom `Store` implementations without durable reservations refuse
+engine signing. A PostgreSQL adapter must implement equivalent shared ownership and
+atomic journal release before enabling signing. Standalone operator methods remain
+unjournaled; never use them for automatic payment processing.
+
+Offline regressions drive the actual `Engine::tick` through funding, sweeping,
+purchase and burn, reopening the store and reconstructing the engine after every
+lost broadcast response. Separate processes contend for one SQLite signer and
+prove orphan ownership survives restart. This is simulated transport, not a live
+chain or production readiness claim. `Chain::block_timestamp_ms(hash)` reads exact
+block time; historical USD still requires an independently verified provider.

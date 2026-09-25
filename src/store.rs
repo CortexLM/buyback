@@ -11,6 +11,26 @@ use std::sync::Mutex;
 /// Async so a database-backed store (e.g. PostgreSQL) can implement it directly.
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
+    async fn require_signing(&self) -> Result<()> {
+        Err(Error::Store(
+            "shared signer reservations unsupported; requests disabled".into(),
+        ))
+    }
+    async fn reserve_signer_for_record(
+        &self,
+        _signer: &str,
+        _rec: &PaymentRecord,
+    ) -> Result<String> {
+        Err(Error::Store("atomic signer reservation unsupported".into()))
+    }
+
+    /// Exclusive durable signer ownership, BEFORE nonce selection. No leases or automatic expiry.
+    /// Implementations must atomically release only when the matching journal is resolved.
+    async fn reserve_signer(&self, _signer: &str, _job: &str) -> Result<String> {
+        Err(Error::Store(
+            "shared durable signer reservations unsupported; signing disabled".into(),
+        ))
+    }
     /// Insert a new record (version 0). Fails if the id exists.
     async fn insert(&self, rec: &PaymentRecord) -> Result<()>;
     async fn get(&self, id: &str) -> Result<Option<PaymentRecord>>;
@@ -76,7 +96,13 @@ impl FileStore {
                 .map_err(store_err)?;
             f.sync_all().map_err(store_err)?;
         }
-        std::fs::rename(&tmp, path).map_err(store_err)
+        std::fs::rename(&tmp, path).map_err(store_err)?;
+        // Persist the directory entry before a journaled transaction can broadcast.
+        #[cfg(unix)]
+        std::fs::File::open(&self.dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(store_err)?;
+        Ok(())
     }
 }
 
@@ -116,6 +142,9 @@ impl Store for FileStore {
         let cur = self
             .read(&p)?
             .ok_or_else(|| Error::NotFound(rec.id.clone()))?;
+        if cur.buyback_budget != rec.buyback_budget || cur.auto_required != rec.auto_required {
+            return Err(Error::Store("immutable job budget".into()));
+        }
         if cur.version != rec.version {
             return Err(Error::Conflict(rec.id.clone()));
         }
@@ -146,7 +175,9 @@ impl SqliteStore {
 
     fn init(conn: rusqlite::Connection) -> Result<Self> {
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+             CREATE TABLE IF NOT EXISTS signer_reservations (
+               signer TEXT PRIMARY KEY, job TEXT NOT NULL, token TEXT NOT NULL UNIQUE);
              CREATE TABLE IF NOT EXISTS payments (
                id TEXT PRIMARY KEY, state TEXT NOT NULL, version INTEGER NOT NULL,
                created_at INTEGER NOT NULL, record TEXT NOT NULL);
@@ -157,11 +188,57 @@ impl SqliteStore {
             conn: Mutex::new(conn),
         })
     }
+    fn reserve(&self, signer: &str, job: &str, version: Option<u64>) -> Result<String> {
+        let mut c = self.conn.lock().map_err(store_err)?;
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_err)?;
+        if let Some(version) = version {
+            let current: Option<i64> = {
+                use rusqlite::OptionalExtension;
+                tx.query_row("SELECT version FROM payments WHERE id=?1", [job], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(store_err)?
+            };
+            if current != i64::try_from(version).ok() {
+                return Err(Error::Conflict(job.into()));
+            }
+        }
+        // Legacy journals also fence the signer; migration cannot make uncertainty disappear.
+        let pending: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM payments WHERE json_extract(record,'$.pending.signer')=?1)",[signer],|r|r.get(0)).map_err(store_err)?;
+        if pending {
+            return Err(Error::Conflict("unresolved signer journal".into()));
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        let count = tx
+            .execute(
+                "INSERT OR IGNORE INTO signer_reservations(signer,job,token) VALUES (?1,?2,?3)",
+                rusqlite::params![signer, job, token],
+            )
+            .map_err(store_err)?;
+        if count != 1 {
+            return Err(Error::Conflict(format!("signer {signer} reserved")));
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(token)
+    }
 }
 
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl Store for SqliteStore {
+    async fn require_signing(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn reserve_signer_for_record(&self, signer: &str, rec: &PaymentRecord) -> Result<String> {
+        self.reserve(signer, &rec.id, Some(rec.version))
+    }
+    async fn reserve_signer(&self, signer: &str, job: &str) -> Result<String> {
+        self.reserve(signer, job, None)
+    }
+
     async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         let c = self.conn.lock().map_err(store_err)?;
         c.execute(
@@ -213,37 +290,77 @@ impl Store for SqliteStore {
     }
 
     async fn update(&self, rec: &PaymentRecord) -> Result<PaymentRecord> {
-        let c = self.conn.lock().map_err(store_err)?;
-        let mut next = rec.clone();
-        next.version += 1;
-        next.updated_at = crate::state::now();
-        let n = c
-            .execute(
-                "UPDATE payments SET state=?1, version=?2, record=?3 WHERE id=?4 AND version=?5",
-                rusqlite::params![
-                    next.state.as_str(),
-                    next.version as i64,
-                    serde_json::to_string(&next).map_err(store_err)?,
-                    rec.id,
-                    rec.version as i64
-                ],
-            )
+        let mut c = self.conn.lock().map_err(store_err)?;
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(store_err)?;
-        match n {
-            1 => Ok(next),
-            _ if self_exists(&c, &rec.id)? => Err(Error::Conflict(rec.id.clone())),
-            _ => Err(Error::NotFound(rec.id.clone())),
+        let previous: String = tx
+            .query_row("SELECT record FROM payments WHERE id=?1", [&rec.id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| {
+                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                    Error::NotFound(rec.id.clone())
+                } else {
+                    store_err(e)
+                }
+            })?;
+        let previous: PaymentRecord = serde_json::from_str(&previous).map_err(store_err)?;
+        if previous.version != rec.version {
+            return Err(Error::Conflict(rec.id.clone()));
         }
+        if previous.buyback_budget != rec.buyback_budget
+            || previous.auto_required != rec.auto_required
+        {
+            return Err(Error::Store("immutable job budget".into()));
+        }
+        if let Some(p) = &rec.pending {
+            let token = p.reservation.as_deref().ok_or_else(|| {
+                Error::Store("legacy journal requires manual reconciliation".into())
+            })?;
+            let owned: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM signer_reservations WHERE signer=?1 AND job=?2 AND token=?3)",rusqlite::params![p.signer,rec.id,token],|r|r.get(0)).map_err(store_err)?;
+            if !owned {
+                return Err(Error::Store("signer reservation mismatch".into()));
+            }
+        }
+        if let Some(p) = &previous.pending {
+            if rec.pending.is_some() && rec.pending != previous.pending {
+                return Err(Error::Store("cannot replace unresolved journal".into()));
+            }
+            if rec.pending.is_none() {
+                let token = p.reservation.as_deref().ok_or_else(|| {
+                    Error::Store("legacy journal requires manual reconciliation".into())
+                })?;
+                let removed = tx
+                    .execute(
+                        "DELETE FROM signer_reservations WHERE signer=?1 AND job=?2 AND token=?3",
+                        rusqlite::params![p.signer, rec.id, token],
+                    )
+                    .map_err(store_err)?;
+                if removed != 1 {
+                    return Err(Error::Store("signer reservation mismatch".into()));
+                }
+            }
+        }
+        let mut next = rec.clone();
+        next.version = next
+            .version
+            .checked_add(1)
+            .ok_or_else(|| Error::Store("version overflow".into()))?;
+        next.updated_at = crate::state::now();
+        tx.execute(
+            "UPDATE payments SET state=?1,version=?2,record=?3 WHERE id=?4",
+            rusqlite::params![
+                next.state.as_str(),
+                next.version as i64,
+                serde_json::to_string(&next).map_err(store_err)?,
+                next.id
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(next)
     }
-}
-
-#[cfg(feature = "sqlite")]
-fn self_exists(c: &rusqlite::Connection, id: &str) -> Result<bool> {
-    c.query_row("SELECT count(*) FROM payments WHERE id=?1", [id], |r| {
-        r.get::<_, i64>(0)
-    })
-    .map(|n| n > 0)
-    .map_err(store_err)
 }
 
 /// Open a store from a spec: `sqlite:<path>`, `file:<dir>`, or a bare path (sqlite).
@@ -264,6 +381,17 @@ pub fn open_store(spec: &str) -> Result<Box<dyn Store>> {
 
 #[async_trait::async_trait]
 impl<S: Store + ?Sized> Store for Box<S> {
+    async fn require_signing(&self) -> Result<()> {
+        (**self).require_signing().await
+    }
+    async fn reserve_signer_for_record(&self, s: &str, r: &PaymentRecord) -> Result<String> {
+        (**self).reserve_signer_for_record(s, r).await
+    }
+
+    async fn reserve_signer(&self, signer: &str, job: &str) -> Result<String> {
+        (**self).reserve_signer(signer, job).await
+    }
+
     async fn insert(&self, rec: &PaymentRecord) -> Result<()> {
         (**self).insert(rec).await
     }
@@ -340,6 +468,102 @@ mod tests {
                 .unwrap()
                 .version,
             1
+        );
+    }
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reservation_child_process() {
+        let Ok(path) = std::env::var("BUYBACK_RESERVATION_TEST_DB") else {
+            return;
+        };
+        let job = std::env::var("BUYBACK_RESERVATION_TEST_JOB").unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = SqliteStore::open(&path).unwrap();
+        let won = rt
+            .block_on(store.reserve_signer("shared-signer", &job))
+            .is_ok();
+        if won {
+            std::fs::write(format!("{path}.{job}.won"), b"reserved").unwrap();
+        }
+        // Simulates process death immediately after durable reservation, before journal.
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn two_processes_one_signer_orphan_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        drop(SqliteStore::open(&path).unwrap());
+        let exe = std::env::current_exe().unwrap();
+        let mut children = vec![];
+        for job in ["job-a", "job-b"] {
+            children.push(
+                std::process::Command::new(&exe)
+                    .args(["--exact", "store::tests::reservation_child_process"])
+                    .env("BUYBACK_RESERVATION_TEST_DB", &path)
+                    .env("BUYBACK_RESERVATION_TEST_JOB", job)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+        let winners = ["job-a", "job-b"]
+            .iter()
+            .filter(|job| std::path::Path::new(&format!("{}.{}.won", path.display(), job)).exists())
+            .count();
+        assert_eq!(winners, 1);
+        let restarted = SqliteStore::open(&path).unwrap();
+        for job in ["job-a", "job-b", "job-c"] {
+            assert!(
+                restarted
+                    .reserve_signer("shared-signer", job)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            restarted
+                .reserve_signer("different-signer", "job-c")
+                .await
+                .is_ok()
+        );
+    }
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn legacy_pending_signer_is_quarantined_on_upgrade() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut rec = test_record("legacy");
+        rec.pending = Some(crate::chain::PendingTx {
+            action: crate::engine::Action::Fund,
+            reservation: None,
+            signer: "legacy-signer".into(),
+            nonce: 1,
+            tx_hash: "hash".into(),
+            birth_block: 10,
+            amount: 1,
+        });
+        store.insert(&rec).await.unwrap();
+        assert!(
+            store
+                .reserve_signer("legacy-signer", "new-job")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .reserve_signer("other-signer", "new-job")
+                .await
+                .is_ok()
+        );
+        assert!(
+            FileStore::open(tempfile::tempdir().unwrap().path())
+                .unwrap()
+                .require_signing()
+                .await
+                .is_err()
         );
     }
 }

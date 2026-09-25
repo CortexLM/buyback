@@ -88,6 +88,33 @@ pub struct BuybackReceipt {
     pub alpha_destroyed: u64,
 }
 
+/// Explicit additional treasury capital, snapshotted when the job is created.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuybackBudget {
+    pub amount_rao: u64,
+    pub currency: String,
+    pub source: String,
+    pub netuid: u16,
+    pub destroy: crate::config::Destroy,
+    pub hotkey: String,
+}
+impl BuybackBudget {
+    pub fn validate(&self) -> Result<()> {
+        crate::keys::parse_ss58(&self.hotkey)?;
+        if (self.netuid == 0 && self.destroy != crate::config::Destroy::Keep)
+            || self.amount_rao < crate::engine::MIN_STAKE_RAO
+            || self.currency != "TAO"
+            || self.source.trim().is_empty()
+            || self.source.len() > 128
+        {
+            return Err(Error::Config(
+                "explicit TAO buyback budget/source required".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Full persisted record. Contains the sealed wallet secret: never return it to clients, use
 /// [`PaymentStatus`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,6 +138,11 @@ pub struct PaymentRecord {
     pub swept_alpha: u64,
     pub txs: Vec<TxRef>,
     pub buyback: Option<BuybackReceipt>,
+    #[serde(default)]
+    pub buyback_budget: Option<BuybackBudget>,
+    /// None identifies legacy jobs requiring explicit migration.
+    #[serde(default)]
+    pub auto_required: Option<bool>,
     pub attempts: u32,
     pub next_attempt_at: u64,
     pub last_error: Option<String>,
@@ -118,12 +150,15 @@ pub struct PaymentRecord {
     /// Extrinsic journaled *before* broadcast. While set, no new action is taken for this record
     /// until the pending one is proven included or dead (see `Engine::resolve_pending`).
     pub pending: Option<crate::chain::PendingTx>,
+    /// Finalized intent with unexpected events; explicit repair required, never retry blindly.
+    #[serde(default)]
+    pub quarantined: Option<crate::chain::PendingTx>,
     /// `(hotkey ss58, alpha)` positions moved to the treasury coldkey by the sweep.
     pub swept_positions: Vec<(String, u64)>,
     /// How many of `swept_positions` were moved onto the treasury hotkey.
     pub consolidated: usize,
     pub dust_returned: bool,
-    /// Auto-buyback finished (done, skipped or given up).
+    /// Requested auto-buyback completed with a validated receipt.
     pub buyback_done: bool,
     pub notified: bool,
     pub updated_at: u64,
@@ -261,11 +296,14 @@ pub(crate) fn test_record(id: &str) -> PaymentRecord {
         swept_alpha: 0,
         txs: vec![],
         buyback: None,
+        buyback_budget: None,
+        auto_required: Some(false),
         attempts: 0,
         next_attempt_at: 0,
         last_error: None,
         failed_from: None,
         pending: None,
+        quarantined: None,
         swept_positions: vec![],
         consolidated: 0,
         dust_returned: false,

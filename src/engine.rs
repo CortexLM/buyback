@@ -6,17 +6,18 @@
 //! compare-and-swap on the record version, and only then submits it. While `pending` is set, the
 //! record takes no new action. After a crash, a timeout or an RPC error, the pending entry is
 //! resolved against finalized chain state ([`Chain::find_pending`]):
-//! * nonce consumed by *our* tx hash: apply its events (success or dispatch failure);
-//! * nonce not consumed and the tx's mortality window (64 blocks) has passed: it can never be
-//!   included, so it is dropped and the step is rebuilt;
+//! * our tx hash found in finalized blocks: apply its events (success or dispatch failure);
+//! * complete finalized scan proves absence after the mortality window: drop and rebuild;
 //! * otherwise: wait.
 //!
 //! Treasury funding and buybacks are therefore sent at most once per step, and the sweep moves
 //! only the stake that is live in the wallet at build time (a replay fails on chain with
 //! `NotEnoughStakeToWithdraw`, it cannot move funds twice).
 
-use crate::chain::{Chain, ChainCall, EventSummary, PendingOutcome, PendingTx};
-use crate::config::{AutoAmount, AutoBuyback, Config, Destroy};
+use crate::chain::{
+    Chain, ChainCall, EventSummary, FinalizedTx, PendingOutcome, PendingTx, PreparedTx,
+};
+use crate::config::{AutoBuyback, Config, Destroy};
 use crate::keys::{self, DerivationSeed, Keyring, PaymentWallet};
 use crate::state::{
     BuybackReceipt, PaymentRecord, PaymentRequest, PaymentState, PaymentStatus, TxRef, now,
@@ -62,8 +63,8 @@ pub struct CreatePayment {
     pub callback_url: Option<String>,
 }
 
-pub struct Engine {
-    chain: Chain,
+pub struct Engine<C = Chain> {
+    chain: C,
     store: Arc<dyn Store>,
     keyring: Arc<Keyring>,
     /// Root of deterministic wallets; records with a `derivation_path` are opened from it.
@@ -76,9 +77,9 @@ pub struct Engine {
     webhook: Option<crate::webhook::Webhook>,
 }
 
-impl Engine {
+impl<C: EngineRpc> Engine<C> {
     pub fn new(
-        chain: Chain,
+        chain: C,
         store: Arc<dyn Store>,
         keyring: impl Into<Keyring>,
         treasury: Keypair,
@@ -115,7 +116,7 @@ impl Engine {
         &self.cfg
     }
 
-    pub fn chain(&self) -> &Chain {
+    pub fn chain(&self) -> &C {
         &self.chain
     }
 
@@ -132,6 +133,7 @@ impl Engine {
 
     /// Create a payment request backed by a brand-new wallet.
     pub async fn create_payment(&self, opts: CreatePayment) -> Result<PaymentRequest> {
+        self.store.require_signing().await?;
         let wallet = PaymentWallet::generate()?;
         let id = uuid::Uuid::new_v4().to_string();
         let address = keys::ss58(&wallet.account_id());
@@ -157,11 +159,14 @@ impl Engine {
             swept_alpha: 0,
             txs: vec![],
             buyback: None,
+            buyback_budget: self.cfg.buyback_budget.clone(),
+            auto_required: Some(self.cfg.buyback_budget.is_some()),
             attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             failed_from: None,
             pending: None,
+            quarantined: None,
             swept_positions: vec![],
             consolidated: 0,
             dust_returned: false,
@@ -170,6 +175,12 @@ impl Engine {
             updated_at: t,
             derivation_path: None,
         };
+        if matches!(self.cfg.auto, AutoBuyback::On { .. }) && rec.buyback_budget.is_none() {
+            return Err(Error::Config("explicit job buyback budget required".into()));
+        }
+        if let Some(budget) = &rec.buyback_budget {
+            budget.validate()?;
+        }
         self.store.insert(&rec).await?;
         tracing::info!(id = %id, address = %address, "payment request created");
         Ok(PaymentRequest {
@@ -197,6 +208,7 @@ impl Engine {
         expected_address: &str,
         metadata: Option<serde_json::Value>,
     ) -> Result<PaymentStatus> {
+        self.store.require_signing().await?;
         let seed = self
             .seed
             .as_ref()
@@ -231,11 +243,14 @@ impl Engine {
             swept_alpha: 0,
             txs: vec![],
             buyback: None,
+            buyback_budget: self.cfg.buyback_budget.clone(),
+            auto_required: Some(self.cfg.buyback_budget.is_some()),
             attempts: 0,
             next_attempt_at: 0,
             last_error: None,
             failed_from: None,
             pending: None,
+            quarantined: None,
             swept_positions: vec![],
             consolidated: 0,
             dust_returned: false,
@@ -244,6 +259,12 @@ impl Engine {
             updated_at: t,
             derivation_path: Some(derivation_path.into()),
         };
+        if matches!(self.cfg.auto, AutoBuyback::On { .. }) && rec.buyback_budget.is_none() {
+            return Err(Error::Config("explicit job buyback budget required".into()));
+        }
+        if let Some(budget) = &rec.buyback_budget {
+            budget.validate()?;
+        }
         self.store.insert(&rec).await?;
         tracing::info!(id, address = %rec.address, "sweep job created");
         Ok(rec.status())
@@ -264,6 +285,11 @@ impl Engine {
             .get(id)
             .await?
             .ok_or_else(|| Error::NotFound(id.into()))?;
+        if r.quarantined.is_some() {
+            return Err(Error::Store(
+                "finalized receipt mismatch requires explicit repair".into(),
+            ));
+        }
         let to = match r.failed_from {
             Some(PaymentState::Pending) | None => PaymentState::Detected,
             Some(s) => s,
@@ -317,7 +343,7 @@ impl Engine {
         use PaymentState::*;
         let recs = self
             .store
-            .list(&[Pending, Detected, Funded, Swept, Settled])
+            .list(&[Pending, Detected, Funded, Swept, Settled, Failed])
             .await?;
         let t = now();
         let mut n = 0;
@@ -333,7 +359,9 @@ impl Engine {
             self.chain.stake_positions_many(&pending).await?
         };
         for r in recs {
-            if r.state == Settled && r.notified || r.next_attempt_at > t {
+            if r.pending.is_none()
+                && (r.state == Failed || r.state == Settled && r.notified || r.next_attempt_at > t)
+            {
                 continue;
             }
             let id = r.id.clone();
@@ -353,6 +381,17 @@ impl Engine {
         mut r: PaymentRecord,
         positions: &std::collections::BTreeMap<AccountId32, Vec<crate::chain::StakePosition>>,
     ) -> Result<bool> {
+        if r.quarantined.is_some() {
+            return Ok(false);
+        }
+        if r.pending.is_none()
+            && (r.auto_required.is_none()
+                || (r.auto_required == Some(true) && r.buyback_budget.is_none()))
+        {
+            return Err(Error::Config(
+                "job policy migration required before processing".into(),
+            ));
+        }
         if let Some(p) = r.pending.clone() {
             return self.resolve_pending(r, p).await;
         }
@@ -374,6 +413,10 @@ impl Engine {
                     .get(&r.id)
                     .await?
                     .ok_or_else(|| Error::NotFound(r.id.clone()))?;
+                // An uncertain broadcast is not a failed economic action. Reconcile first.
+                if cur.pending.is_some() {
+                    return Err(e);
+                }
                 cur.record_failure(&e.to_string(), self.cfg.max_attempts, now());
                 let cur = self.store.update(&cur).await?;
                 self.announce_if_final(&cur);
@@ -540,8 +583,19 @@ impl Engine {
             r.dust_returned = true;
         }
         // 3. automatic buyback
-        if let (AutoBuyback::On { destroy, amount }, false) = (self.cfg.auto, r.buyback_done) {
-            return self.step_auto_buyback(r, destroy, amount).await;
+        let required = r
+            .auto_required
+            .ok_or_else(|| Error::Config("legacy job policy requires explicit migration".into()))?;
+        if required && r.buyback_budget.is_none() {
+            return Err(Error::Config("required job budget missing".into()));
+        }
+        if required && r.buyback_done {
+            validate_completed_buyback(r)?;
+        }
+        if !r.buyback_done
+            && (r.buyback_budget.is_some() || matches!(self.cfg.auto, AutoBuyback::On { .. }))
+        {
+            return self.step_auto_buyback(r).await;
         }
         r.transition(PaymentState::Settled)?;
         *r = self.store.update(r).await?;
@@ -551,21 +605,42 @@ impl Engine {
         Ok(true)
     }
 
-    async fn step_auto_buyback(
-        &self,
-        r: &mut PaymentRecord,
-        destroy: Destroy,
-        amount: AutoAmount,
-    ) -> Result<bool> {
-        let netuid = self.cfg.buyback_netuid;
+    async fn step_auto_buyback(&self, r: &mut PaymentRecord) -> Result<bool> {
+        let budget = r
+            .buyback_budget
+            .clone()
+            .ok_or_else(|| Error::Config("job has no explicit buyback budget; blocked".into()))?;
+        budget.validate()?;
+        let netuid = budget.netuid;
+        let destroy = budget.destroy;
         // second half: destroy what was bought
         if let Some(b) = &r.buyback {
-            if destroy == Destroy::Keep || b.destroy_tx.is_some() || b.alpha_bought == 0 {
+            if b.tao_spent != budget.amount_rao || b.netuid != budget.netuid {
+                return Err(Error::Store(
+                    "purchase receipt disagrees with job budget".into(),
+                ));
+            }
+            if b.alpha_bought == 0 {
+                return Err(Error::Insufficient(
+                    "buyback produced no alpha; completion blocked".into(),
+                ));
+            }
+            if b.destroy_tx.is_some() && b.alpha_destroyed != b.alpha_bought {
+                return Err(Error::Store(
+                    "incomplete burn receipt; completion blocked".into(),
+                ));
+            }
+            if destroy == Destroy::Keep || b.destroy_tx.is_some() {
                 r.buyback_done = true;
                 *r = self.store.update(r).await?;
                 return Ok(true);
             }
-            let call = destroy_call(destroy, self.cfg.treasury_hotkey, netuid, b.alpha_bought);
+            let call = destroy_call(
+                destroy,
+                keys::parse_ss58(&budget.hotkey)?,
+                netuid,
+                b.alpha_bought,
+            );
             let signer = self.treasury.clone();
             let _g = self.treasury_lock.lock().await;
             let action = Action::Destroy {
@@ -575,31 +650,15 @@ impl Engine {
             return self.send(r, action, &call, &signer).await;
         }
         let _g = self.treasury_lock.lock().await;
-        let tao = match amount {
-            AutoAmount::All => self.spendable().await?,
-            AutoAmount::Fixed(v) => v,
-            AutoAmount::PaymentValueBps(bps) => {
-                let price = self.chain.alpha_price(r.netuid).await?;
-                let value =
-                    units::alpha_value_in_tao(r.swept_alpha, price).saturating_add(r.detected_tao);
-                (value as u128 * bps as u128 / units::BPS as u128) as u64
-            }
-        };
-        let tao = tao.min(self.spendable().await?);
-        if tao < MIN_STAKE_RAO {
-            tracing::warn!(id = %r.id, tao, "auto buyback skipped: amount below minimum stake");
-            r.buyback_done = true;
-            *r = self.store.update(r).await?;
-            return Ok(true);
-        }
+        let tao = strict_buyback_amount(budget.amount_rao, self.spendable().await?)?;
         let limit_price =
             units::buy_limit_price(self.chain.alpha_price(netuid).await?, self.cfg.slippage_bps);
         let call = ChainCall::AddStakeLimit {
-            hotkey: self.cfg.treasury_hotkey,
+            hotkey: keys::parse_ss58(&budget.hotkey)?,
             netuid,
             tao,
             limit_price,
-            allow_partial: self.cfg.allow_partial,
+            allow_partial: false,
         };
         let signer = self.treasury.clone();
         self.send(
@@ -631,63 +690,25 @@ impl Engine {
         call: &ChainCall,
         signer: &Keypair,
     ) -> Result<bool> {
-        let prepared = self.chain.prepare(call, signer).await?;
-        let mut j = r.clone();
-        j.pending = Some(PendingTx {
-            action,
-            signer: prepared.signer.clone(),
-            nonce: prepared.nonce,
-            tx_hash: prepared.tx_hash.clone(),
-            birth_block: prepared.birth_block,
-            amount: call.amount(),
-        });
-        // Journal before broadcast: a lost race or a failed write sends nothing.
-        *r = self.store.update(&j).await?;
-        let ftx = self.chain.broadcast(&prepared).await?;
-        self.apply(r, ftx.tx, &ftx.summary)?;
-        *r = self.store.update(r).await?;
-        Ok(true)
+        send_journaled(&self.chain, self.store.as_ref(), r, action, call, signer).await
     }
 
-    /// Resolve a journaled tx against finalized chain state.
     async fn resolve_pending(&self, mut r: PaymentRecord, p: PendingTx) -> Result<bool> {
-        match self.chain.find_pending(&p).await? {
-            PendingOutcome::Wait => Ok(false),
-            PendingOutcome::Dead => {
-                tracing::warn!(id = %r.id, tx = %p.tx_hash, "journaled tx expired unincluded; rebuilding step");
-                r.pending = None;
-                self.store.update(&r).await?;
-                Ok(true)
-            }
-            PendingOutcome::Included {
-                block_hash,
-                summary,
-            } => {
-                let tx = TxRef {
-                    action: action_name(&p.action).into(),
-                    tx_hash: p.tx_hash.clone(),
-                    block_hash,
-                    amount: p.amount,
-                };
-                if summary.failed {
-                    r.pending = None;
-                    r.record_failure(
-                        &format!("{} failed on chain in {}", tx.action, tx.block_hash),
-                        self.cfg.max_attempts,
-                        now(),
-                    );
-                } else {
-                    self.apply(&mut r, tx, &summary)?;
-                }
-                let r = self.store.update(&r).await?;
-                self.announce_if_final(&r);
-                Ok(true)
-            }
+        let changed = reconcile_journaled(
+            &self.chain,
+            self.store.as_ref(),
+            &mut r,
+            &p,
+            self.cfg.max_attempts,
+        )
+        .await?;
+        if changed {
+            self.announce_if_final(&r);
         }
+        Ok(changed)
     }
 
-    /// Apply the effects of a successful journaled tx to the record.
-    fn apply(&self, r: &mut PaymentRecord, tx: TxRef, s: &EventSummary) -> Result<()> {
+    fn apply(r: &mut PaymentRecord, tx: TxRef, s: &EventSummary) -> Result<()> {
         let action = r
             .pending
             .take()
@@ -712,6 +733,11 @@ impl Engine {
                 limit_price,
             } => {
                 let (tao, alpha) = s.stake_added.ok_or(Error::EventMissing("StakeAdded"))?;
+                if tao != tx.amount || alpha == 0 {
+                    return Err(Error::Store(
+                        "purchase does not match full requested budget".into(),
+                    ));
+                }
                 r.buyback = Some(BuybackReceipt {
                     netuid: *netuid,
                     tao_spent: tao,
@@ -726,14 +752,22 @@ impl Engine {
                 let destroyed = s
                     .alpha_destroyed
                     .ok_or(Error::EventMissing("AlphaBurned/AlphaRecycled"))?;
-                if let Some(b) = r.buyback.as_mut() {
-                    b.destroy_tx = Some(tx.clone());
-                    b.alpha_destroyed = destroyed;
+                let b = r
+                    .buyback
+                    .as_mut()
+                    .ok_or_else(|| Error::Store("burn without purchase receipt".into()))?;
+                if destroyed != b.alpha_bought || destroyed == 0 {
+                    return Err(Error::Store(
+                        "burn amount does not match purchased alpha".into(),
+                    ));
                 }
+                b.destroy_tx = Some(tx.clone());
+                b.alpha_destroyed = destroyed;
                 r.buyback_done = true;
             }
         }
         r.attempts = 0;
+        r.next_attempt_at = 0;
         r.last_error = None;
         r.txs.push(tx);
         Ok(())
@@ -915,5 +949,766 @@ fn action_name(a: &Action) -> &'static str {
         Action::BuyStake { .. } => "add_stake_limit",
         Action::Destroy { recycle: true, .. } => "recycle_alpha",
         Action::Destroy { .. } => "burn_alpha",
+    }
+}
+
+/// Engine transport, injectable for offline state-machine tests.
+#[async_trait::async_trait]
+pub trait EngineRpc: TransactionRpc {
+    async fn free_balance(&self, who: &AccountId32) -> Result<u64>;
+    async fn account(&self, who: &AccountId32) -> Result<(u64, u32)>;
+    async fn alpha_on(
+        &self,
+        who: &AccountId32,
+        netuid: u16,
+    ) -> Result<(u64, Vec<crate::chain::StakePosition>)>;
+    async fn alpha_of(
+        &self,
+        hotkey: &AccountId32,
+        coldkey: &AccountId32,
+        netuid: u16,
+    ) -> Result<u64>;
+    async fn estimate_fee(&self, call: &ChainCall, signer: &Keypair) -> Result<u64>;
+    async fn existential_deposit(&self) -> Result<u64>;
+    async fn alpha_price(&self, netuid: u16) -> Result<u64>;
+    async fn hotkey_owner(&self, hotkey: &AccountId32) -> Result<Option<AccountId32>>;
+    async fn stake_positions_many(
+        &self,
+        coldkeys: &[AccountId32],
+    ) -> Result<std::collections::BTreeMap<AccountId32, Vec<crate::chain::StakePosition>>>;
+    async fn submit(&self, call: &ChainCall, signer: &Keypair) -> Result<FinalizedTx>;
+    async fn finalized_blocks(
+        &self,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<u64>> + Send>>>;
+}
+#[async_trait::async_trait]
+impl EngineRpc for Chain {
+    async fn free_balance(&self, who: &AccountId32) -> Result<u64> {
+        Chain::free_balance(self, who).await
+    }
+    async fn account(&self, who: &AccountId32) -> Result<(u64, u32)> {
+        Chain::account(self, who).await
+    }
+    async fn alpha_on(
+        &self,
+        who: &AccountId32,
+        netuid: u16,
+    ) -> Result<(u64, Vec<crate::chain::StakePosition>)> {
+        Chain::alpha_on(self, who, netuid).await
+    }
+    async fn alpha_of(
+        &self,
+        hotkey: &AccountId32,
+        coldkey: &AccountId32,
+        netuid: u16,
+    ) -> Result<u64> {
+        Chain::alpha_of(self, hotkey, coldkey, netuid).await
+    }
+    async fn estimate_fee(&self, call: &ChainCall, signer: &Keypair) -> Result<u64> {
+        Chain::estimate_fee(self, call, signer).await
+    }
+    async fn existential_deposit(&self) -> Result<u64> {
+        Chain::existential_deposit(self).await
+    }
+    async fn alpha_price(&self, netuid: u16) -> Result<u64> {
+        Chain::alpha_price(self, netuid).await
+    }
+    async fn hotkey_owner(&self, hotkey: &AccountId32) -> Result<Option<AccountId32>> {
+        Chain::hotkey_owner(self, hotkey).await
+    }
+    async fn stake_positions_many(
+        &self,
+        coldkeys: &[AccountId32],
+    ) -> Result<std::collections::BTreeMap<AccountId32, Vec<crate::chain::StakePosition>>> {
+        Chain::stake_positions_many(self, coldkeys).await
+    }
+    async fn submit(&self, call: &ChainCall, signer: &Keypair) -> Result<FinalizedTx> {
+        Chain::submit(self, call, signer).await
+    }
+    async fn finalized_blocks(
+        &self,
+    ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<u64>> + Send>>> {
+        Ok(Box::pin(Chain::finalized_blocks(self).await?))
+    }
+}
+/// Narrow transaction seam; tests supply no network client or live signer.
+#[async_trait::async_trait]
+pub trait TransactionRpc: Send + Sync {
+    async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx>;
+    async fn broadcast(&self, tx: &PreparedTx) -> Result<FinalizedTx>;
+    async fn find_pending(&self, tx: &PendingTx) -> Result<PendingOutcome>;
+}
+#[async_trait::async_trait]
+impl TransactionRpc for Chain {
+    async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx> {
+        Chain::prepare(self, call, signer).await
+    }
+    async fn broadcast(&self, tx: &PreparedTx) -> Result<FinalizedTx> {
+        Chain::broadcast(self, tx).await
+    }
+    async fn find_pending(&self, tx: &PendingTx) -> Result<PendingOutcome> {
+        Chain::find_pending(self, tx).await
+    }
+}
+async fn send_journaled(
+    rpc: &dyn TransactionRpc,
+    store: &dyn Store,
+    r: &mut PaymentRecord,
+    action: Action,
+    call: &ChainCall,
+    signer: &Keypair,
+) -> Result<bool> {
+    if r.pending.is_some() {
+        return Err(Error::Store(
+            "reconcile pending transaction before preparing another".into(),
+        ));
+    }
+    let signer_address = keys::ss58(&signer.public_key().to_account_id());
+    let reservation = store.reserve_signer_for_record(&signer_address, r).await?;
+    // A crash or prepare error leaves an orphan reservation: never expire it automatically.
+    let prepared = rpc.prepare(call, signer).await?;
+    if prepared.signer != signer_address {
+        return Err(Error::Store("prepared signer mismatch".into()));
+    }
+    let mut journal = r.clone();
+    journal.pending = Some(PendingTx {
+        action,
+        reservation: Some(reservation),
+        signer: prepared.signer.clone(),
+        nonce: prepared.nonce,
+        tx_hash: prepared.tx_hash.clone(),
+        birth_block: prepared.birth_block,
+        amount: call.amount(),
+    });
+    *r = store.update(&journal).await?;
+    let finalized = rpc.broadcast(&prepared).await?;
+    let mut applied = r.clone();
+    Engine::<Chain>::apply(&mut applied, finalized.tx, &finalized.summary)?;
+    *r = store.update(&applied).await?;
+    Ok(true)
+}
+async fn reconcile_journaled(
+    rpc: &dyn TransactionRpc,
+    store: &dyn Store,
+    r: &mut PaymentRecord,
+    pending: &PendingTx,
+    max_attempts: u32,
+) -> Result<bool> {
+    if r.pending.as_ref() != Some(pending) {
+        return Err(Error::Store("pending journal mismatch".into()));
+    }
+    match rpc.find_pending(pending).await? {
+        PendingOutcome::Wait => Ok(false),
+        PendingOutcome::Dead => {
+            let mut applied = r.clone();
+            applied.pending = None;
+            *r = store.update(&applied).await?;
+            Ok(true)
+        }
+        PendingOutcome::Included {
+            block_hash,
+            summary,
+        } => {
+            let tx = TxRef {
+                action: action_name(&pending.action).into(),
+                tx_hash: pending.tx_hash.clone(),
+                block_hash,
+                amount: pending.amount,
+            };
+            let mut applied = r.clone();
+            if summary.failed {
+                applied.pending = None;
+                applied.record_failure(
+                    "journaled transaction failed on finalized chain",
+                    max_attempts,
+                    now(),
+                );
+            } else {
+                if let Err(error) = Engine::<Chain>::apply(&mut applied, tx.clone(), &summary) {
+                    applied = r.clone();
+                    applied.pending = None;
+                    applied.quarantined = Some(pending.clone());
+                    applied.txs.push(tx);
+                    applied.record_failure(
+                        &format!("finalized receipt mismatch: {error}"),
+                        1,
+                        now(),
+                    );
+                }
+            }
+            *r = store.update(&applied).await?;
+            Ok(true)
+        }
+    }
+}
+
+fn validate_completed_buyback(r: &PaymentRecord) -> Result<()> {
+    let budget = r
+        .buyback_budget
+        .as_ref()
+        .ok_or_else(|| Error::Store("missing job budget".into()))?;
+    budget.validate()?;
+    let receipt = r
+        .buyback
+        .as_ref()
+        .ok_or_else(|| Error::Store("missing purchase receipt".into()))?;
+    if receipt.tao_spent != budget.amount_rao
+        || receipt.netuid != budget.netuid
+        || receipt.alpha_bought == 0
+        || receipt.stake_tx.block_hash.is_empty()
+        || (budget.destroy != Destroy::Keep
+            && (receipt.alpha_destroyed != receipt.alpha_bought
+                || receipt.destroy_tx.as_ref().is_none_or(|tx| {
+                    tx.block_hash.is_empty()
+                        || tx.action
+                            != if budget.destroy == Destroy::Burn {
+                                "burn_alpha"
+                            } else {
+                                "recycle_alpha"
+                            }
+                })))
+    {
+        return Err(Error::Store("incomplete job buyback receipt".into()));
+    }
+    Ok(())
+}
+
+fn strict_buyback_amount(requested: u64, spendable: u64) -> Result<u64> {
+    if requested < MIN_STAKE_RAO {
+        return Err(Error::Insufficient(
+            "buyback budget below minimum; blocked, not skipped".into(),
+        ));
+    }
+    if requested > spendable {
+        return Err(Error::Insufficient(
+            "full buyback budget unavailable; no partial spend".into(),
+        ));
+    }
+    Ok(requested)
+}
+
+#[cfg(test)]
+mod strict_budget_tests {
+    use super::*;
+    #[test]
+    fn no_silent_clamp_or_skipped_success() {
+        assert!(strict_buyback_amount(0, u64::MAX).is_err());
+        assert!(strict_buyback_amount(MIN_STAKE_RAO - 1, u64::MAX).is_err());
+        assert!(strict_buyback_amount(MIN_STAKE_RAO, MIN_STAKE_RAO - 1).is_err());
+        assert_eq!(
+            strict_buyback_amount(MIN_STAKE_RAO, MIN_STAKE_RAO).unwrap(),
+            MIN_STAKE_RAO
+        );
+        assert_eq!(
+            strict_buyback_amount(MIN_STAKE_RAO, u64::MAX).unwrap(),
+            MIN_STAKE_RAO
+        );
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod journal_rpc_tests {
+    use super::*;
+    use crate::{keys::MasterKey, store::SqliteStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct LostReply {
+        broadcasts: AtomicUsize,
+        summary: EventSummary,
+        lookup: AtomicUsize,
+        dead: bool,
+    }
+    #[async_trait::async_trait]
+    impl TransactionRpc for LostReply {
+        async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx> {
+            Ok(PreparedTx {
+                call: call.clone(),
+                signer: keys::ss58(&signer.public_key().to_account_id()),
+                nonce: 7,
+                tx_hash: format!("hash-{}", self.broadcasts.load(Ordering::SeqCst)),
+                birth_block: 100,
+                bytes: vec![],
+            })
+        }
+        async fn broadcast(&self, _: &PreparedTx) -> Result<FinalizedTx> {
+            self.broadcasts.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Chain("connection lost after inclusion".into()))
+        }
+        async fn find_pending(&self, _: &PendingTx) -> Result<PendingOutcome> {
+            if self.dead {
+                return Ok(PendingOutcome::Dead);
+            }
+            match self.lookup.fetch_add(1, Ordering::SeqCst) {
+                0 => return Err(Error::Chain("intermittent RPC".into())),
+                1 => return Ok(PendingOutcome::Wait),
+                _ => {}
+            }
+            Ok(PendingOutcome::Included {
+                block_hash: "finalized-test-block".into(),
+                summary: self.summary.clone(),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn durable_journal_recovers_lost_replies_without_rebroadcast() {
+        let dir = std::env::temp_dir().join(format!("buyback-journal-{}", uuid::Uuid::new_v4()));
+        let store = SqliteStore::open(&dir).unwrap();
+        let wallet = PaymentWallet::generate().unwrap();
+        let sealed = wallet
+            .seal_with(&MasterKey::generate().into(), b"test")
+            .unwrap();
+        let mut rec:PaymentRecord=serde_json::from_value(serde_json::json!({
+            "id":"simulation","address":keys::ss58(&wallet.account_id()),"netuid":100,
+            "min_alpha":0,"min_tao":null,"created_at":1,"expires_at":9999999999u64,
+            "state":"detected","version":0,"sealed_secret":sealed,"metadata":null,"callback_url":null,
+            "detected_alpha":0,"detected_tao":0,"funded_tao":0,"swept_alpha":0,"txs":[],"buyback":null,
+            "attempts":0,"next_attempt_at":0,"last_error":null,"failed_from":null,"pending":null,
+            "swept_positions":[],"consolidated":0,"dust_returned":false,"buyback_done":false,"notified":false,"updated_at":1
+        })).unwrap();
+        store.insert(&rec).await.unwrap();
+        let who = wallet.account_id();
+        let steps = [
+            (
+                Action::Fund,
+                ChainCall::TransferTao {
+                    dest: who,
+                    amount: 3_000_000,
+                },
+                EventSummary::default(),
+            ),
+            (
+                Action::Sweep {
+                    hotkey: keys::ss58(&who),
+                },
+                ChainCall::TransferStake {
+                    dest_coldkey: who,
+                    hotkey: who,
+                    netuid: 100,
+                    alpha: 10,
+                },
+                EventSummary {
+                    names: vec![(crate::chain::PALLET.into(), "StakeTransferred".into())],
+                    ..Default::default()
+                },
+            ),
+            (
+                Action::BuyStake {
+                    netuid: 100,
+                    limit_price: 1,
+                },
+                ChainCall::AddStakeLimit {
+                    hotkey: who,
+                    netuid: 100,
+                    tao: MIN_STAKE_RAO,
+                    limit_price: 1,
+                    allow_partial: false,
+                },
+                EventSummary {
+                    stake_added: Some((MIN_STAKE_RAO, 20)),
+                    ..Default::default()
+                },
+            ),
+            (
+                Action::Destroy {
+                    netuid: 100,
+                    recycle: false,
+                },
+                ChainCall::BurnAlpha {
+                    hotkey: who,
+                    netuid: 100,
+                    alpha: 20,
+                },
+                EventSummary {
+                    alpha_destroyed: Some(20),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (action, call, summary) in steps {
+            let rpc = LostReply {
+                broadcasts: AtomicUsize::new(0),
+                summary,
+                lookup: AtomicUsize::new(0),
+                dead: false,
+            };
+            assert!(
+                send_journaled(
+                    &rpc,
+                    &store,
+                    &mut rec,
+                    action.clone(),
+                    &call,
+                    wallet.keypair()
+                )
+                .await
+                .is_err()
+            );
+            // A new store instance models process loss; only disk journal survives.
+            let reopened = SqliteStore::open(&dir).unwrap();
+            rec = reopened.get("simulation").await.unwrap().unwrap();
+            let pending = rec.pending.clone().unwrap();
+            assert_eq!(pending.action, action);
+            assert_eq!(pending.tx_hash, "hash-0");
+            assert!(
+                send_journaled(&rpc, &reopened, &mut rec, action, &call, wallet.keypair())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 1);
+            let before = rec.version;
+            assert!(
+                reconcile_journaled(&rpc, &reopened, &mut rec, &pending, 8)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !reconcile_journaled(&rpc, &reopened, &mut rec, &pending, 8)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(rec.version, before);
+            assert_eq!(
+                reopened.get("simulation").await.unwrap().unwrap().pending,
+                Some(pending.clone())
+            );
+            assert!(
+                reconcile_journaled(&rpc, &reopened, &mut rec, &pending, 8)
+                    .await
+                    .unwrap()
+            );
+            assert!(rec.pending.is_none());
+            assert!(
+                reconcile_journaled(&rpc, &reopened, &mut rec, &pending, 8)
+                    .await
+                    .is_err()
+            );
+            if rec.state == PaymentState::Funded && rec.swept_alpha > 0 {
+                rec.transition(PaymentState::Swept).unwrap();
+                rec = reopened.update(&rec).await.unwrap();
+            }
+        }
+        assert_eq!(rec.txs.len(), 4);
+        assert_eq!(rec.swept_alpha, 10);
+        assert_eq!(rec.buyback.as_ref().unwrap().tao_spent, MIN_STAKE_RAO);
+        assert_eq!(rec.buyback.as_ref().unwrap().alpha_destroyed, 20);
+        assert!(rec.buyback_done);
+        rec.transition(PaymentState::Settled).unwrap();
+        store.update(&rec).await.unwrap();
+        drop(store);
+        std::fs::remove_file(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn stale_journal_cannot_broadcast() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("store.db")).unwrap();
+        let mut rec = crate::state::test_record("stale");
+        store.insert(&rec).await.unwrap();
+        store.update(&rec).await.unwrap();
+        let rpc = LostReply {
+            broadcasts: AtomicUsize::new(0),
+            summary: EventSummary::default(),
+            lookup: AtomicUsize::new(2),
+            dead: false,
+        };
+        let wallet = PaymentWallet::generate().unwrap();
+        let call = ChainCall::TransferTao {
+            dest: wallet.account_id(),
+            amount: 1,
+        };
+        assert!(matches!(
+            send_journaled(
+                &rpc,
+                &store,
+                &mut rec,
+                Action::Fund,
+                &call,
+                wallet.keypair()
+            )
+            .await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+        assert!(rec.pending.is_none());
+        assert!(
+            store
+                .reserve_signer(&keys::ss58(&wallet.account_id()), "next")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_finalized_burn_quarantines_job_and_releases_signer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("store.db")).unwrap();
+        let mut rec = crate::state::test_record("burn");
+        rec.state = PaymentState::Swept;
+        let tx = TxRef {
+            action: "add_stake_limit".into(),
+            tx_hash: "buy".into(),
+            block_hash: "block".into(),
+            amount: MIN_STAKE_RAO,
+        };
+        rec.buyback = Some(BuybackReceipt {
+            netuid: 100,
+            tao_spent: MIN_STAKE_RAO,
+            alpha_bought: 20,
+            limit_price: 1,
+            stake_tx: tx,
+            destroy_tx: None,
+            alpha_destroyed: 0,
+        });
+        let pending = PendingTx {
+            action: Action::Destroy {
+                netuid: 100,
+                recycle: false,
+            },
+            reservation: Some(store.reserve_signer("test-only", "burn").await.unwrap()),
+            signer: "test-only".into(),
+            nonce: 1,
+            tx_hash: "burn".into(),
+            birth_block: 100,
+            amount: 20,
+        };
+        rec.pending = Some(pending.clone());
+        store.insert(&rec).await.unwrap();
+        let rpc = LostReply {
+            broadcasts: AtomicUsize::new(0),
+            summary: EventSummary {
+                alpha_destroyed: Some(19),
+                ..Default::default()
+            },
+            lookup: AtomicUsize::new(2),
+            dead: false,
+        };
+        assert!(
+            reconcile_journaled(&rpc, &store, &mut rec, &pending, 8)
+                .await
+                .unwrap()
+        );
+        let stored = store.get("burn").await.unwrap().unwrap();
+        assert!(stored.pending.is_none());
+        assert_eq!(stored.quarantined, Some(pending));
+        assert!(!stored.buyback_done);
+        assert_eq!(stored.state, PaymentState::Failed);
+        assert_eq!(stored.txs.len(), 1);
+        assert!(
+            store
+                .reserve_signer("test-only", "another-job")
+                .await
+                .is_ok()
+        );
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verified_dead_intent_releases_signer_without_completion() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut rec = crate::state::test_record("dead");
+        let pending = PendingTx {
+            action: Action::Fund,
+            reservation: Some(store.reserve_signer("signer", "dead").await.unwrap()),
+            signer: "signer".into(),
+            nonce: 1,
+            tx_hash: "dead-hash".into(),
+            birth_block: 1,
+            amount: 1,
+        };
+        rec.pending = Some(pending.clone());
+        store.insert(&rec).await.unwrap();
+        let rpc = LostReply {
+            broadcasts: AtomicUsize::new(0),
+            summary: EventSummary::default(),
+            lookup: AtomicUsize::new(0),
+            dead: true,
+        };
+        assert!(
+            reconcile_journaled(&rpc, &store, &mut rec, &pending, 8)
+                .await
+                .unwrap()
+        );
+        assert!(rec.pending.is_none());
+        assert!(!rec.buyback_done);
+        assert!(store.reserve_signer("signer", "next").await.is_ok());
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+    }
+    struct SimulatedChain {
+        broadcasts: AtomicUsize,
+        hotkey: AccountId32,
+        result: std::sync::Mutex<EventSummary>,
+    }
+    #[async_trait::async_trait]
+    impl TransactionRpc for SimulatedChain {
+        async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx> {
+            let nonce = self.broadcasts.load(Ordering::SeqCst) as u64;
+            Ok(PreparedTx {
+                call: call.clone(),
+                signer: keys::ss58(&signer.public_key().to_account_id()),
+                nonce,
+                tx_hash: format!("simulated-{nonce}"),
+                birth_block: 100,
+                bytes: vec![],
+            })
+        }
+        async fn broadcast(&self, tx: &PreparedTx) -> Result<FinalizedTx> {
+            self.broadcasts.fetch_add(1, Ordering::SeqCst);
+            let mut summary = EventSummary::default();
+            match &tx.call {
+                ChainCall::TransferTao { .. } => {}
+                ChainCall::TransferStake { .. } => summary
+                    .names
+                    .push((crate::chain::PALLET.into(), "StakeTransferred".into())),
+                ChainCall::AddStakeLimit {
+                    tao, allow_partial, ..
+                } => {
+                    assert!(!allow_partial);
+                    summary.stake_added = Some((*tao, 20));
+                }
+                ChainCall::BurnAlpha { alpha, .. } => summary.alpha_destroyed = Some(*alpha),
+                _ => panic!("unexpected simulated action"),
+            }
+            *self.result.lock().unwrap() = summary;
+            Err(Error::Chain("simulated lost broadcast response".into()))
+        }
+        async fn find_pending(&self, _: &PendingTx) -> Result<PendingOutcome> {
+            Ok(PendingOutcome::Included {
+                block_hash: "simulated-finalized-block".into(),
+                summary: self.result.lock().unwrap().clone(),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl EngineRpc for Arc<SimulatedChain> {
+        async fn free_balance(&self, _: &AccountId32) -> Result<u64> {
+            Ok(1_000_000_000)
+        }
+        async fn account(&self, _: &AccountId32) -> Result<(u64, u32)> {
+            Ok((0, 0))
+        }
+        async fn alpha_on(
+            &self,
+            _: &AccountId32,
+            netuid: u16,
+        ) -> Result<(u64, Vec<crate::chain::StakePosition>)> {
+            Ok((
+                1_000_000_000,
+                vec![crate::chain::StakePosition {
+                    hotkey: self.hotkey,
+                    netuid,
+                    alpha: 1_000_000_000,
+                }],
+            ))
+        }
+        async fn alpha_of(&self, _: &AccountId32, _: &AccountId32, _: u16) -> Result<u64> {
+            panic!("consolidation disabled")
+        }
+        async fn estimate_fee(&self, _: &ChainCall, _: &Keypair) -> Result<u64> {
+            Ok(100)
+        }
+        async fn existential_deposit(&self) -> Result<u64> {
+            Ok(100)
+        }
+        async fn alpha_price(&self, _: u16) -> Result<u64> {
+            Ok(1_000_000_000)
+        }
+        async fn hotkey_owner(&self, _: &AccountId32) -> Result<Option<AccountId32>> {
+            panic!("no association")
+        }
+        async fn stake_positions_many(
+            &self,
+            _: &[AccountId32],
+        ) -> Result<std::collections::BTreeMap<AccountId32, Vec<crate::chain::StakePosition>>>
+        {
+            panic!("starts at detected")
+        }
+        async fn submit(&self, _: &ChainCall, _: &Keypair) -> Result<FinalizedTx> {
+            panic!("unjournaled submit prohibited")
+        }
+        async fn finalized_blocks(
+            &self,
+        ) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<u64>> + Send>>> {
+            panic!("test drives tick")
+        }
+    }
+    #[async_trait::async_trait]
+    impl TransactionRpc for Arc<SimulatedChain> {
+        async fn prepare(&self, c: &ChainCall, s: &Keypair) -> Result<PreparedTx> {
+            self.as_ref().prepare(c, s).await
+        }
+        async fn broadcast(&self, t: &PreparedTx) -> Result<FinalizedTx> {
+            self.as_ref().broadcast(t).await
+        }
+        async fn find_pending(&self, t: &PendingTx) -> Result<PendingOutcome> {
+            self.as_ref().find_pending(t).await
+        }
+    }
+    #[tokio::test]
+    async fn engine_ticks_complete_after_each_lost_response_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine.db");
+        let wallet = PaymentWallet::generate().unwrap();
+        let treasury = PaymentWallet::generate().unwrap();
+        let keyring: Keyring = MasterKey::from_bytes([42; 32]).into();
+        let mut rec = crate::state::test_record("engine");
+        rec.netuid = 100;
+        rec.auto_required = Some(true);
+        rec.address = keys::ss58(&wallet.account_id());
+        rec.sealed_secret = wallet
+            .seal_with(&keyring, &keys::wallet_aad(&rec.id, &rec.address))
+            .unwrap();
+        rec.state = PaymentState::Detected;
+        rec.buyback_budget = Some(crate::state::BuybackBudget {
+            amount_rao: MIN_STAKE_RAO,
+            currency: "TAO".into(),
+            source: "explicit-test-allocation".into(),
+            hotkey: keys::ss58(&treasury.account_id()),
+            netuid: 100,
+            destroy: Destroy::Burn,
+        });
+        SqliteStore::open(&path)
+            .unwrap()
+            .insert(&rec)
+            .await
+            .unwrap();
+        let rpc = Arc::new(SimulatedChain {
+            broadcasts: AtomicUsize::new(0),
+            hotkey: treasury.account_id(),
+            result: std::sync::Mutex::new(EventSummary::default()),
+        });
+        let mut cfg = Config::new("unused", 100, treasury.account_id());
+        cfg.consolidate = false;
+        cfg.return_dust = false;
+        // Runtime defaults deliberately differ: the persisted job budget wins.
+        cfg.buyback_budget = None;
+        for _ in 0..12 {
+            let store = Arc::new(SqliteStore::open(&path).unwrap());
+            let engine = Engine::new(
+                rpc.clone(),
+                store.clone(),
+                MasterKey::from_bytes([42; 32]),
+                treasury.keypair().clone(),
+                cfg.clone(),
+            );
+            engine.tick().await.unwrap();
+            rec = store.get("engine").await.unwrap().unwrap();
+            if rec.state == PaymentState::Settled {
+                break;
+            }
+        }
+        assert_eq!(rec.state, PaymentState::Settled);
+        assert!(rec.buyback_done);
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 4);
+        assert_eq!(rec.txs.len(), 4);
+        assert_eq!(rec.buyback.as_ref().unwrap().tao_spent, MIN_STAKE_RAO);
+        assert_eq!(rec.buyback.as_ref().unwrap().alpha_destroyed, 20);
+        assert!(rec.pending.is_none());
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(
+            store
+                .reserve_signer(&keys::ss58(&treasury.account_id()), "next-job")
+                .await
+                .is_ok()
+        );
+        rec.buyback_budget.as_mut().unwrap().amount_rao += 1;
+        assert!(store.update(&rec).await.is_err());
     }
 }

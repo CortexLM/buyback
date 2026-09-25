@@ -220,6 +220,9 @@ pub struct FinalizedTx {
 pub struct PendingTx {
     /// What the transaction does; decides how its result is applied.
     pub action: crate::engine::Action,
+    /// Durable exclusive signer reservation; absent in legacy journals.
+    #[serde(default)]
+    pub reservation: Option<String>,
     pub signer: String,
     pub nonce: u64,
     pub tx_hash: String,
@@ -440,6 +443,19 @@ impl Chain {
             }
             None => Ok((0, 0)),
         }
+    }
+
+    /// Timestamp.Now in milliseconds, fetched at an exact block hash.
+    /// Missing timestamp (including genesis) is an error, never wall-clock time.
+    pub async fn block_timestamp_ms(&self, hash: subxt::utils::H256) -> Result<u64> {
+        let at = self.api.at_block(hash).await.map_err(chain_err)?;
+        let value = at
+            .storage()
+            .try_fetch(dynamic::storage::<(), u64>("Timestamp", "Now"), ())
+            .await
+            .map_err(chain_err)?
+            .ok_or_else(|| Error::Chain("block timestamp unavailable".into()))?;
+        value.decode().map_err(chain_err)
     }
 
     pub async fn free_balance(&self, who: &AccountId32) -> Result<u64> {
@@ -674,7 +690,7 @@ impl Chain {
     }
 
     /// Build and sign `call` with an explicit nonce, mortal for [`MORTALITY`] blocks. Nothing is
-    /// sent: persist [`PreparedTx::journal`] first, then [`Chain::broadcast`].
+    /// sent: persist a [`PendingTx`] first, then [`Chain::broadcast`].
     pub async fn prepare(&self, call: &ChainCall, signer: &Keypair) -> Result<PreparedTx> {
         let at = self.api.at_current_block().await.map_err(chain_err)?;
         let payload = call.payload();
@@ -786,19 +802,15 @@ impl Chain {
 
     /// Look for a journaled extrinsic in finalized blocks `birth ..= birth + MORTALITY`.
     pub async fn find_pending(&self, p: &PendingTx) -> Result<PendingOutcome> {
-        let signer = crate::keys::parse_ss58(&p.signer)?;
-        let (_, nonce) = self.account(&signer).await?;
         let head = self.best_finalized_number().await?;
-        let horizon = p.birth_block + MORTALITY + 1;
-        if (nonce as u64) <= p.nonce {
-            // Nonce unused on finalized state: the tx is not included (yet).
-            return Ok(if head > horizon {
-                PendingOutcome::Dead
-            } else {
-                PendingOutcome::Wait
-            });
-        }
-        // Nonce consumed: find which tx used it.
+        let horizon = p
+            .birth_block
+            .checked_add(MORTALITY)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| Error::Chain("transaction mortality overflow".into()))?;
+        // Do not infer absence from a separate nonce read: it may be stale or
+        // from another head. Scan finalized hashes; any RPC error retains intent.
+        // Search the entire possible inclusion window before declaring death.
         for n in p.birth_block..=head.min(horizon) {
             let at = self.api.at_block(n).await.map_err(chain_err)?;
             let exts = at.extrinsics().fetch().await.map_err(chain_err)?;
@@ -813,7 +825,7 @@ impl Chain {
                 }
             }
         }
-        // Nonce consumed by a different transaction (the key is used elsewhere): ours is dead.
+        // Complete finalized scan proved absence, and mortality has elapsed.
         Ok(if head > horizon {
             PendingOutcome::Dead
         } else {
