@@ -815,30 +815,26 @@ impl<C: EngineRpc> Engine<C> {
 
     // ------------------------------------------------------------------ buybacks
 
-    /// Make sure `treasury_hotkey` exists on chain and is owned by the treasury coldkey, creating
-    /// it with `try_associate_hotkey` if needed. Staking, `move_stake` and `burn_alpha` all fail
-    /// with `HotKeyAccountNotExists` otherwise. Call once at startup.
+    /// Verify the treasury hotkey already exists. Never signs or submits at startup.
+    /// Association must be provisioned separately before starting signing workers.
     pub async fn ensure_treasury_hotkey(&self) -> Result<()> {
         let hk = &self.cfg.treasury_hotkey;
         match self.chain.hotkey_owner(hk).await? {
             Some(o) if o == self.treasury_account() => Ok(()),
             Some(o) => {
-                // Staking to a hotkey you do not own works but delegates to its owner (take
-                // applies) and `burn_alpha` still works; warn loudly rather than fail.
                 tracing::warn!(hotkey = %keys::ss58(hk), owner = %keys::ss58(&o), "treasury hotkey is owned by another coldkey");
                 Ok(())
             }
-            None => {
-                let _g = self.treasury_lock.lock().await;
-                let call = ChainCall::AssociateHotkey { hotkey: *hk };
-                self.chain.submit(&call, &self.treasury).await?;
-                tracing::info!(hotkey = %keys::ss58(hk), "treasury hotkey associated");
-                Ok(())
-            }
+            // ponytail: startup is read-only; provision association separately until
+            // association has its own durable job and reconciliation protocol.
+            None => Err(Error::Config(
+                "treasury hotkey is not associated; provision it before starting signing workers"
+                    .into(),
+            )),
         }
     }
 
-    /// Treasury TAO available to `buyback_all`: free minus `fee_reserve` minus existential deposit.
+    /// Treasury TAO available to budgeted jobs: free minus `fee_reserve` minus existential deposit.
     pub async fn spendable(&self) -> Result<u64> {
         let free = self.chain.free_balance(&self.treasury_account()).await?;
         Ok(units::spendable(
@@ -848,77 +844,36 @@ impl<C: EngineRpc> Engine<C> {
         ))
     }
 
-    /// Spend `amount_tao` rao of treasury TAO on alpha of `buyback_netuid` (default 100) with
-    /// `add_stake_limit` at `spot * (1 + slippage)`. The alpha stays staked to the treasury hotkey.
+    /// Disabled standalone API. Use a durable payment/sweep job with an explicit budget.
     pub async fn buyback(&self, amount_tao: u64) -> Result<BuybackReceipt> {
         self.buyback_with(amount_tao, Destroy::Keep).await
     }
 
-    /// [`Self::buyback`] then `burn_alpha` of exactly the alpha bought.
+    /// Disabled standalone API; see [`Self::buyback`].
     pub async fn buyback_and_burn(&self, amount_tao: u64) -> Result<BuybackReceipt> {
         self.buyback_with(amount_tao, Destroy::Burn).await
     }
 
-    /// [`Self::buyback`] then `recycle_alpha` of exactly the alpha bought.
+    /// Disabled standalone API; see [`Self::buyback`].
     pub async fn buyback_and_recycle(&self, amount_tao: u64) -> Result<BuybackReceipt> {
         self.buyback_with(amount_tao, Destroy::Recycle).await
     }
 
-    /// Buy back with the whole spendable treasury balance.
+    /// Disabled: an entire live balance is not an immutable job budget.
     pub async fn buyback_all(&self, destroy: Destroy) -> Result<BuybackReceipt> {
-        let amount = self.spendable().await?;
-        self.buyback_with(amount, destroy).await
+        self.buyback_with(0, destroy).await
     }
 
-    /// Standalone buyback. Not journaled: on an error the caller must check the treasury's
-    /// stake/balance (e.g. `buyback status`) before retrying.
-    pub async fn buyback_with(&self, amount_tao: u64, destroy: Destroy) -> Result<BuybackReceipt> {
-        let _g = self.treasury_lock.lock().await;
-        let netuid = self.cfg.buyback_netuid;
-        let spendable = self.spendable().await?;
-        if amount_tao == 0 || amount_tao > spendable {
-            return Err(Error::Insufficient(format!(
-                "buyback of {} TAO, spendable {} TAO (fee reserve {})",
-                units::format_amount(amount_tao),
-                units::format_amount(spendable),
-                units::format_amount(self.cfg.fee_reserve)
-            )));
-        }
-        let price = self.chain.alpha_price(netuid).await?;
-        let limit_price = units::buy_limit_price(price, self.cfg.slippage_bps);
-        let hotkey = self.cfg.treasury_hotkey;
-        let buy = ChainCall::AddStakeLimit {
-            hotkey,
-            netuid,
-            tao: amount_tao,
-            limit_price,
-            allow_partial: self.cfg.allow_partial,
-        };
-        let f = self.chain.submit(&buy, &self.treasury).await?;
-        let (tao_spent, alpha_bought) = f
-            .summary
-            .stake_added
-            .ok_or(Error::EventMissing("StakeAdded"))?;
-        let mut receipt = BuybackReceipt {
-            netuid,
-            tao_spent,
-            alpha_bought,
-            limit_price,
-            stake_tx: f.tx,
-            destroy_tx: None,
-            alpha_destroyed: 0,
-        };
-        if destroy != Destroy::Keep && alpha_bought > 0 {
-            let call = destroy_call(destroy, hotkey, netuid, alpha_bought);
-            let d = self.chain.submit(&call, &self.treasury).await?;
-            receipt.alpha_destroyed = d
-                .summary
-                .alpha_destroyed
-                .ok_or(Error::EventMissing("AlphaBurned"))?;
-            receipt.destroy_tx = Some(d.tx);
-        }
-        tracing::info!(?receipt, "buyback done");
-        Ok(receipt)
+    /// Refuses before any RPC/signature. Standalone calls have no durable job journal.
+    pub async fn buyback_with(
+        &self,
+        _amount_tao: u64,
+        _destroy: Destroy,
+    ) -> Result<BuybackReceipt> {
+        // ponytail: standalone execution stays disabled until it has durable job semantics.
+        Err(Error::Config(
+            "standalone buyback disabled; use a durable payment/sweep job with an explicit buyback budget".into(),
+        ))
     }
 }
 
@@ -1648,6 +1603,7 @@ mod journal_rpc_tests {
     struct SimulatedChain {
         broadcasts: AtomicUsize,
         hotkey: AccountId32,
+        owner: Option<AccountId32>,
         result: std::sync::Mutex<EventSummary>,
     }
     #[async_trait::async_trait]
@@ -1725,7 +1681,7 @@ mod journal_rpc_tests {
             Ok(1_000_000_000)
         }
         async fn hotkey_owner(&self, _: &AccountId32) -> Result<Option<AccountId32>> {
-            panic!("no association")
+            Ok(self.owner)
         }
         async fn stake_positions_many(
             &self,
@@ -1755,6 +1711,53 @@ mod journal_rpc_tests {
             self.as_ref().find_pending(t).await
         }
     }
+    #[tokio::test]
+    async fn startup_missing_hotkey_never_submits_or_releases_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("startup.db");
+        let treasury = PaymentWallet::generate().unwrap();
+        let signer = keys::ss58(&treasury.account_id());
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        store.reserve_signer(&signer, "unresolved").await.unwrap();
+        let rpc = Arc::new(SimulatedChain {
+            broadcasts: AtomicUsize::new(0),
+            hotkey: treasury.account_id(),
+            owner: None,
+            result: std::sync::Mutex::new(EventSummary::default()),
+        });
+        let engine = Engine::new(
+            rpc.clone(),
+            store,
+            MasterKey::from_bytes([42; 32]),
+            treasury.keypair().clone(),
+            Config::new("unused", 100, treasury.account_id()),
+        );
+        let (a, b) = tokio::join!(
+            engine.ensure_treasury_hotkey(),
+            engine.ensure_treasury_hotkey()
+        );
+        assert!(matches!(a, Err(Error::Config(_))));
+        assert!(matches!(b, Err(Error::Config(_))));
+        for result in [
+            engine.buyback(1).await,
+            engine.buyback_and_burn(1).await,
+            engine.buyback_and_recycle(1).await,
+            engine.buyback_all(Destroy::Burn).await,
+            engine.buyback_with(1, Destroy::Keep).await,
+        ] {
+            assert!(matches!(result, Err(Error::Config(_))));
+        }
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+        drop(engine);
+        assert!(
+            SqliteStore::open(&path)
+                .unwrap()
+                .reserve_signer(&signer, "other")
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn engine_ticks_complete_after_each_lost_response_and_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1786,6 +1789,7 @@ mod journal_rpc_tests {
         let rpc = Arc::new(SimulatedChain {
             broadcasts: AtomicUsize::new(0),
             hotkey: treasury.account_id(),
+            owner: Some(treasury.account_id()),
             result: std::sync::Mutex::new(EventSummary::default()),
         });
         let mut cfg = Config::new("unused", 100, treasury.account_id());

@@ -102,8 +102,11 @@ The localnet test covers this directly. It sends the funding transfer, "crashes"
 it, starts a new engine on the same store, and asserts the payment settles with the fee sent
 **exactly once**.
 
-Standalone `buyback*()` calls are *not* journaled. They are operator actions. If one errors,
-check `buyback balances` before running it again.
+Standalone `Engine::buyback*()` calls and the CLI buyback command now fail closed with
+`Error::Config` before signing or submission. This is a compatibility change: use a durable
+payment/sweep job with an explicit immutable `BuybackBudget` and drive `Engine::tick`.
+There is no standalone-job replacement yet. `Chain::prepare`/`broadcast`/`submit` remain
+low-level primitives without Store ownership guarantees; never mix them with live workers.
 
 ## Static deposit addresses
 
@@ -150,17 +153,14 @@ cfg.buyback_budget = Some(state::BuybackBudget {
     hotkey: keys::ss58(&cfg.treasury_hotkey),
 });
 let engine = Arc::new(Engine::new(chain, store, master, treasury, cfg));
-engine.ensure_treasury_hotkey().await?;               // try_associate_hotkey if missing
+engine.ensure_treasury_hotkey().await?;               // read-only; fails if hotkey is missing
 
 let req: PaymentRequest = engine.create_payment(CreatePayment::default()).await?;
 let status: PaymentStatus = engine.status(&req.id).await?;
 let mut settled = engine.subscribe();                 // in-process callback
 tokio::spawn({ let e = engine.clone(); async move { e.run().await } });
 
-engine.buyback(units::parse_amount("10")?).await?;          // buy, keep staked
-engine.buyback_and_burn(units::parse_amount("10")?).await?; // buy, burn_alpha
-engine.buyback_and_recycle(units::RAO_PER_TAO).await?;      // buy, recycle_alpha
-engine.buyback_all(Destroy::Burn).await?;                   // whole balance - fee_reserve
+// Standalone buyback wrappers are disabled; the job above carries its budget.
 # Ok(()) }
 ```
 
@@ -171,8 +171,8 @@ engine.buyback_all(Destroy::Burn).await?;                   // whole balance - f
 | `Engine::run()` / `Engine::tick()` | follow finalized blocks / one pass |
 | `Engine::subscribe()` | `broadcast::Receiver<PaymentStatus>` for settled/failed/expired |
 | `Engine::retry(id)`, `Engine::force_sweep(id)` | operator recovery |
-| `Engine::buyback`, `buyback_and_burn`, `buyback_and_recycle`, `buyback_all`, `buyback_with` | treasury buybacks, return `BuybackReceipt` |
-| `Engine::ensure_treasury_hotkey()` | create the treasury hotkey account if missing |
+| `Engine::buyback`, `buyback_and_burn`, `buyback_and_recycle`, `buyback_all`, `buyback_with` | disabled; return `Error::Config`, migrate to budgeted jobs |
+| `Engine::ensure_treasury_hotkey()` | verify a pre-provisioned treasury hotkey; never submit at startup |
 | `Chain` | `verify_metadata`, `stake_positions`, `alpha_price`, `estimate_fee`, `submit`, `find_pending` |
 | `Store` trait, `SqliteStore`, `FileStore`, `open_store("sqlite:..."/"file:...")` | persistence with compare-and-swap |
 | `MasterKey`, `PaymentWallet`, `TreasuryKeySource` | key custody |
@@ -192,7 +192,7 @@ export BUYBACK_NETWORK=local BUYBACK_NETUID=2 BUYBACK_TREASURY_HOTKEY=5...
 buyback create --metadata '{"order":123}'
 buyback status <id>
 buyback run --listen 127.0.0.1:8080      # watcher + HTTP (http feature)
-buyback buyback 10 --then burn           # or `all`, --then keep|burn|recycle
+buyback buyback 10 --then burn           # disabled: use budgeted durable jobs
 buyback balances
 ```
 
@@ -270,7 +270,7 @@ subnet issuance is tracked
 | effect | alpha is permanently destroyed and counted as burned supply. Issuance keeps counting it, so the emission schedule (which follows issuance) is unaffected | alpha goes back to the "unissued" pool: issuance and outstanding supply shrink, so it can be emitted again |
 
 For a "buy and burn" that permanently removes supply and shows up as burned, use `burn_alpha`,
-which is what `buyback_and_burn` does. `buyback_and_recycle` and `Destroy::Recycle` are there if
+which is what budgeted jobs with `Destroy::Burn` do. `Destroy::Recycle` is available if
 you want the alpha returned to future emissions instead. Neither can be undone. Neither works on
 the root subnet (`CannotBurnOrRecycleOnRootSubnet`), and the hotkey must exist on chain.
 
@@ -325,8 +325,8 @@ alpha to a fresh deposit address. The test then checks:
   balances before and after;
 * a simulated restart mid-flow;
 * a crash-after-broadcast recovery that must not fund twice;
-* `buyback`, `buyback_and_burn` and `buyback_and_recycle`, with their balance and event deltas;
-* the fee-reserve guard.
+* standalone wrappers refused without a treasury balance change;
+* durable job budget and fee-reserve guards.
 
 It only uses well-known dev accounts (`//Alice`, `//Bob` and their derivations). CI runs it
 against the localnet image as a service container.
@@ -336,8 +336,9 @@ against the localnet image as a service container.
 1. Run `buyback verify-metadata --network finney` and confirm every call and event resolves.
 2. Generate the master key and store it in your secret manager. Seal the treasury mnemonic into a
    keystore (`seal-treasury`).
-3. Pick the treasury hotkey. Either use a hotkey you own and have registered, or let
-   `ensure_treasury_hotkey` run `try_associate_hotkey`. It must not be a subnet system account.
+3. Provision the treasury hotkey before starting signing workers.
+   `ensure_treasury_hotkey` is read-only and fails when the hotkey is absent.
+   It must not be a subnet system account.
 4. Fund the treasury coldkey with working TAO for fees, and set `fee_reserve`.
 5. Start with `auto = off` and a small `min_alpha`. Do one real payment, check `buyback status`,
    then enable auto-buyback.

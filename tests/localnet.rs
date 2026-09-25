@@ -156,6 +156,22 @@ async fn full_flow() {
         cfg.clone(),
     ));
     let mut settled = engine.subscribe();
+    // Explicit isolated-localnet provisioning, never engine startup behavior.
+    if chain
+        .hotkey_owner(&id(&treasury_hk))
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(engine.ensure_treasury_hotkey().await.is_err());
+        raw(
+            &chain,
+            &treasury,
+            "try_associate_hotkey",
+            vec![Value::from_bytes(id(&treasury_hk).0)],
+        )
+        .await;
+    }
     engine.ensure_treasury_hotkey().await.unwrap();
     assert_eq!(
         chain.hotkey_owner(&id(&treasury_hk)).await.unwrap(),
@@ -391,53 +407,18 @@ async fn full_flow() {
     );
     assert!(s2.swept_alpha >= RAO_PER_TAO);
 
-    // --- explicit buyback (keep) and buyback_and_burn ---
-    let thk = id(&treasury_hk);
-    let a0 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t0 = chain.free_balance(&tre).await.unwrap();
-    let r1 = engine.buyback(RAO_PER_TAO).await.unwrap();
-    let a1 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t1 = chain.free_balance(&tre).await.unwrap();
-    println!(
-        "--- buyback 1 TAO ---\n{r1:?}\ntreasury TAO {} -> {}, alpha(netuid {buy_net}) {} -> {}",
-        format_amount(t0),
-        format_amount(t1),
-        format_amount(a0),
-        format_amount(a1)
-    );
-    assert_eq!(r1.tao_spent, RAO_PER_TAO);
-    assert!(r1.alpha_bought > 0 && r1.destroy_tx.is_none());
-    assert!(t1 <= t0 - RAO_PER_TAO);
-    assert!((a1 - a0).abs_diff(r1.alpha_bought) <= 1, "{a0} -> {a1}");
-
-    let r2 = engine.buyback_and_burn(RAO_PER_TAO).await.unwrap();
-    let a2 = chain.alpha_of(&thk, &tre, buy_net).await.unwrap();
-    let t2 = chain.free_balance(&tre).await.unwrap();
-    println!(
-        "--- buyback_and_burn 1 TAO ---\n{r2:?}\ntreasury TAO {} -> {}, alpha(netuid {buy_net}) {} -> {}",
-        format_amount(t1),
-        format_amount(t2),
-        format_amount(a1),
-        format_amount(a2)
-    );
-    assert!(r2.destroy_tx.is_some());
-    assert_eq!(r2.alpha_destroyed, r2.alpha_bought);
-    assert!(t2 <= t1 - RAO_PER_TAO);
-    assert!(
-        a2.abs_diff(a1) <= 1,
-        "bought alpha was burned: {a1} -> {a2}"
-    );
-
-    // recycle variant
-    let r3 = engine.buyback_and_recycle(RAO_PER_TAO / 2).await.unwrap();
-    println!("--- buyback_and_recycle 0.5 TAO ---\n{r3:?}");
-    assert_eq!(r3.alpha_destroyed, r3.alpha_bought);
-
-    // Guard: cannot spend beyond the reserve.
-    assert!(matches!(
-        engine.buyback(u64::MAX / 2).await,
-        Err(Error::Insufficient(_))
-    ));
+    // Standalone wrappers cannot bypass the durable job protocol.
+    let balance = chain.free_balance(&tre).await.unwrap();
+    for result in [
+        engine.buyback(RAO_PER_TAO).await,
+        engine.buyback_and_burn(RAO_PER_TAO).await,
+        engine.buyback_and_recycle(RAO_PER_TAO).await,
+        engine.buyback_all(Destroy::Burn).await,
+        engine.buyback_with(RAO_PER_TAO, Destroy::Keep).await,
+    ] {
+        assert!(matches!(result, Err(Error::Config(_))));
+    }
+    assert_eq!(chain.free_balance(&tre).await.unwrap(), balance);
 }
 
 /// Static deposit address: a deterministic wallet receives two `transfer_stake`s, the block
@@ -581,6 +562,22 @@ async fn static_address_scan_and_sweep() {
         cfg,
     )
     .with_seed(seed.clone());
+    // Explicit isolated-localnet provisioning, never engine startup behavior.
+    if chain
+        .hotkey_owner(&id(&treasury_hk))
+        .await
+        .unwrap()
+        .is_none()
+    {
+        assert!(engine.ensure_treasury_hotkey().await.is_err());
+        raw(
+            &chain,
+            &treasury,
+            "try_associate_hotkey",
+            vec![Value::from_bytes(id(&treasury_hk).0)],
+        )
+        .await;
+    }
     engine.ensure_treasury_hotkey().await.unwrap();
     // wrong expected address is refused before anything is stored
     assert!(
