@@ -1,0 +1,59 @@
+[package]
+name = "bittensor-buyback"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Bittensor subnet alpha payments on one-time deposit wallets, automatic sweeps to a treasury, and TAO buybacks (burn_alpha / recycle_alpha)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/CortexLM/buyback"
+readme = "README.md"
+keywords = ["bittensor", "subtensor", "alpha", "buyback", "substrate"]
+categories = ["cryptography::cryptocurrencies"]
+
+[[bin]]
+name = "buyback"
+path = "src/bin/buyback.rs"
+
+[[test]]
+name = "localnet"
+required-features = ["localnet-tests", "sqlite"]
+
+[dependencies]
+axum = { version = "0.8.9", optional = true }
+bip39 = { version = "2", features = ["zeroize"] }
+chacha20poly1305 = "0.10"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+codec = { version = "3", package = "parity-scale-codec" }
+futures = "0.3.34"
+hex = "0.4.3"
+hmac = { version = "0.12", optional = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"], optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
+scale-decode = { version = "0.16.2", features = ["derive"] }
+scale-value = "0.18"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = { version = "0.10", optional = true }
+subxt = "0.51"
+subxt-signer = "0.51"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = "1.9.0"
+
+[features]
+default = ["sqlite"]
+## SQLite store
+sqlite = ["dep:rusqlite"]
+## axum HTTP handler (create / status endpoints)
+http = ["dep:axum"]
+## HMAC-signed webhook callbacks on settlement
+webhook = ["dep:reqwest", "dep:hmac", "dep:sha2"]
+## run the localnet integration tests (needs a running subtensor localnet)
+localnet-tests = []
+
+[dev-dependencies]
+tempfile = "3.27.0"

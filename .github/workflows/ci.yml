@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features sqlite,http,webhook
+      - run: cargo test --no-default-features --lib
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  localnet:
+    runs-on: ubuntu-latest
+    services:
+      subtensor:
+        image: ghcr.io/opentensor/subtensor-localnet:devnet-ready
+        # fast-blocks runtime (the image's default CMD is "True")
+        ports:
+          - 9944:9944
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --all-features --tests
+      - name: wait for localnet
+        run: |
+          for i in $(seq 1 90); do
+            if curl -sf -H 'content-type: application/json' \
+                 -d '{"id":1,"jsonrpc":"2.0","method":"chain_getFinalizedHead"}' \
+                 http://127.0.0.1:9944 >/dev/null; then echo up; exit 0; fi
+            sleep 2
+          done
+          echo "localnet did not start"; exit 1
+      - run: cargo run --example verify_metadata -- local
+      - run: cargo test --all-features --test localnet -- --nocapture
