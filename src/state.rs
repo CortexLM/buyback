@@ -115,6 +115,17 @@ impl BuybackBudget {
     }
 }
 
+/// Immutable execution identity; absent on legacy records, never inferred during resume.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobIdentity {
+    pub genesis_hash: String,
+    pub treasury: String,
+    pub treasury_hotkey: String,
+    pub consolidate: bool,
+    pub return_dust: bool,
+}
+
 /// Full persisted record. Contains the sealed wallet secret: never return it to clients, use
 /// [`PaymentStatus`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +154,8 @@ pub struct PaymentRecord {
     /// None identifies legacy jobs requiring explicit migration.
     #[serde(default)]
     pub auto_required: Option<bool>,
+    #[serde(default)]
+    pub identity: Option<JobIdentity>,
     pub attempts: u32,
     pub next_attempt_at: u64,
     pub last_error: Option<String>,
@@ -298,6 +311,7 @@ pub(crate) fn test_record(id: &str) -> PaymentRecord {
         buyback: None,
         buyback_budget: None,
         auto_required: Some(false),
+        identity: None,
         attempts: 0,
         next_attempt_at: 0,
         last_error: None,

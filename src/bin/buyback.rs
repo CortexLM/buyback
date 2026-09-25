@@ -115,6 +115,19 @@ enum Cmd {
         #[arg(long, env = "BUYBACK_NETWORK", default_value = "local")]
         network: String,
     },
+    /// Verify a legacy manifest against a trusted archive; no signing keys are loaded.
+    #[cfg(feature = "sqlite")]
+    RecoverLegacy {
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        #[arg(long)]
+        database: std::path::PathBuf,
+        #[arg(long)]
+        archive: String,
+        /// Commit policy and audit evidence after verification. Default is read-only dry run.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Create a payment request.
     Create {
         #[command(flatten)]
@@ -278,6 +291,41 @@ async fn main() -> R<()> {
             for line in Chain::connect(net.url()).await?.verify_metadata().await? {
                 println!("{line}");
             }
+        }
+        #[cfg(feature = "sqlite")]
+        Cmd::RecoverLegacy {
+            manifest,
+            database,
+            archive,
+            apply,
+        } => {
+            use bittensor_buyback::Store;
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(manifest)?
+                .take(4 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > 4 * 1024 * 1024 {
+                return Err("manifest too large".into());
+            }
+            let manifest: bittensor_buyback::recovery::LegacyManifest =
+                serde_json::from_slice(&bytes)?;
+            let mut store = if apply {
+                bittensor_buyback::SqliteStore::open(database)?
+            } else {
+                bittensor_buyback::SqliteStore::open_read_only(database)?
+            };
+            let record = store
+                .get(&manifest.job)
+                .await?
+                .ok_or("legacy job not found")?;
+            let chain = Chain::connect(&archive).await?;
+            let report = if apply {
+                store.recover_legacy(&chain, &manifest).await?
+            } else {
+                bittensor_buyback::recovery::dry_run(&chain, &record, &manifest).await?
+            };
+            print(&report)?;
         }
         Cmd::Create {
             c,

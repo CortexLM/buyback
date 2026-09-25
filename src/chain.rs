@@ -300,6 +300,9 @@ impl Endpoint {
 }
 
 impl Chain {
+    pub fn genesis_hash(&self) -> String {
+        format!("{:?}", self.api.genesis_hash())
+    }
     pub async fn connect(url: &str) -> Result<Self> {
         Self::connect_endpoint(&Endpoint::new(url)).await
     }
@@ -833,6 +836,98 @@ impl Chain {
         })
     }
 
+    /// Exhaustive trusted-archive scan for explicit legacy recovery. Never signs.
+    pub(crate) async fn verify_legacy_archive(
+        &self,
+        record: &crate::state::PaymentRecord,
+        manifest: &crate::recovery::LegacyManifest,
+    ) -> Result<(Vec<EventSummary>, u64, String)> {
+        let bad = || Error::Chain("incomplete or inconsistent legacy archive evidence".into());
+        if format!("{:?}", self.api.genesis_hash()) != manifest.genesis_hash {
+            return Err(bad());
+        }
+        let (head, hash) = self.finalized_head().await?;
+        let horizon = manifest
+            .stopped_at
+            .checked_add(manifest.maximum_mortality)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(bad)?;
+        // Bound work, never truncate a requested scan or infer absence from a subset.
+        if head <= horizon || head.checked_sub(manifest.first_block).ok_or_else(bad)? > 100_000 {
+            return Err(bad());
+        }
+        let treasury = crate::keys::parse_ss58(&manifest.treasury)?;
+        let deposit = crate::keys::parse_ss58(&record.address)?;
+        let start = self
+            .api
+            .at_block(manifest.first_block - 1)
+            .await
+            .map_err(chain_err)?;
+        let mut next_nonces = std::collections::BTreeMap::new();
+        for who in [treasury, deposit] {
+            let addr = dynamic::storage::<(AccountId32,), AccountInfo>("System", "Account");
+            let nonce = match start
+                .storage()
+                .try_fetch(addr, (who,))
+                .await
+                .map_err(chain_err)?
+            {
+                Some(v) => u64::from(v.decode().map_err(chain_err)?.nonce),
+                None => 0,
+            };
+            next_nonces.insert(who, nonce);
+        }
+        let mut summaries = Vec::new();
+        for number in manifest.first_block..=head {
+            let at = self.api.at_block(number).await.map_err(chain_err)?;
+            let exts = at.extrinsics().fetch().await.map_err(chain_err)?;
+            for ext in exts.iter() {
+                let ext = ext.map_err(chain_err)?;
+                let Some(address) = ext.address_bytes() else {
+                    continue;
+                };
+                // Unknown address encodings cannot be silently omitted from a completeness claim.
+                let signer = signer_of(address).ok_or_else(bad)?;
+                if signer != treasury && signer != deposit {
+                    continue;
+                }
+                let expected = manifest.transactions.get(summaries.len()).ok_or_else(|| {
+                    Error::Chain(format!("unexplained signer activity at block {number}, extrinsic {}; multi-job treasury histories are unsupported", ext.index()))
+                })?;
+                let nonce = ext
+                    .transaction_extensions()
+                    .and_then(|e| e.nonce())
+                    .ok_or_else(bad)?;
+                if expected.block != number
+                    || expected.index != ext.index()
+                    || expected.signer != crate::keys::ss58(&signer)
+                    || expected.nonce != nonce
+                    || next_nonces.get(&signer) != Some(&nonce)
+                    || expected.receipt.tx_hash != format!("{:?}", ext.hash())
+                    || expected.receipt.block_hash != format!("{:?}", at.block_hash())
+                    || at
+                        .tx()
+                        .call_data(&expected.call.payload())
+                        .map_err(chain_err)?
+                        != ext.call_data_bytes()
+                {
+                    return Err(bad());
+                }
+                next_nonces.insert(signer, nonce.checked_add(1).ok_or_else(bad)?);
+                let events = ext.events().await.map_err(chain_err)?;
+                summaries.push(EventSummary::from_events(events.iter())?);
+            }
+        }
+        if summaries.len() != manifest.transactions.len() {
+            return Err(bad());
+        }
+        // Revalidate the exact finalized anchor after the scan.
+        if self.block_hash_at(head).await?.as_deref() != Some(hash.as_str()) {
+            return Err(bad());
+        }
+        Ok((summaries, head, hash))
+    }
+
     /// Stream of finalized block numbers.
     pub async fn finalized_blocks(
         &self,
@@ -953,7 +1048,8 @@ pub fn decode_partial_fee(bytes: &[u8]) -> Result<u64> {
 }
 
 /// Every extrinsic this crate sends.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ChainCall {
     /// `Balances.transfer_keep_alive(dest, value)`
     TransferTao { dest: AccountId32, amount: u64 },

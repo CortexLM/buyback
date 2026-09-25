@@ -210,7 +210,10 @@ impl Store for FileStore {
         let cur = self
             .read(&p)?
             .ok_or_else(|| Error::NotFound(rec.id.clone()))?;
-        if cur.buyback_budget != rec.buyback_budget || cur.auto_required != rec.auto_required {
+        if cur.buyback_budget != rec.buyback_budget
+            || cur.auto_required != rec.auto_required
+            || cur.identity != rec.identity
+        {
             return Err(Error::Store("immutable job budget".into()));
         }
         if cur.version != rec.version {
@@ -237,6 +240,16 @@ impl SqliteStore {
         Self::init(conn)
     }
 
+    /// Open an existing database without schema or pragma writes.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let conn =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(store_err)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
     pub fn in_memory() -> Result<Self> {
         Self::init(rusqlite::Connection::open_in_memory().map_err(store_err)?)
     }
@@ -256,6 +269,64 @@ impl SqliteStore {
             conn: Mutex::new(conn),
         })
     }
+    /// Apply a freshly verified legacy manifest under an exclusive SQLite transaction.
+    /// The database write lock fences all new reservations while the archive is read.
+    /// Existing reservations/journals are never deleted or adopted by this operation.
+    pub async fn recover_legacy(
+        &mut self,
+        chain: &crate::Chain,
+        manifest: &crate::recovery::LegacyManifest,
+    ) -> Result<crate::recovery::RecoveryReport> {
+        // ponytail: offline exclusive maintenance; SQLite fences other processes throughout the scan.
+        let c = self.conn.get_mut().map_err(store_err)?;
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_err)?;
+        let json: String = tx
+            .query_row(
+                "SELECT record FROM payments WHERE id=?1",
+                [&manifest.job],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+        let record: PaymentRecord = serde_json::from_str(&json).map_err(store_err)?;
+        crate::recovery::validate_manifest(&record, manifest)?;
+        let busy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM signer_reservations WHERE signer IN (?1,?2) OR job=?3) OR EXISTS(SELECT 1 FROM payments WHERE json_extract(record,'$.pending.signer') IN (?1,?2) OR json_extract(record,'$.quarantined.signer') IN (?1,?2))",
+            rusqlite::params![record.address,manifest.treasury,record.id],|r|r.get(0),
+        ).map_err(store_err)?;
+        if busy {
+            return Err(Error::Conflict(
+                "legacy recovery signers have unresolved ownership".into(),
+            ));
+        }
+        let (mut next, mut report) = crate::recovery::verify(chain, &record, manifest).await?;
+        next.version = next
+            .version
+            .checked_add(1)
+            .ok_or_else(|| store_err("version overflow"))?;
+        next.updated_at = crate::state::now();
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS legacy_recoveries (job TEXT NOT NULL, previous_version INTEGER NOT NULL, manifest TEXT NOT NULL, report TEXT NOT NULL, PRIMARY KEY(job,previous_version));").map_err(store_err)?;
+        report.applied = true;
+        let changed = tx
+            .execute(
+                "UPDATE payments SET version=?1,record=?2 WHERE id=?3 AND version=?4",
+                rusqlite::params![
+                    i64::try_from(next.version).map_err(store_err)?,
+                    serde_json::to_string(&next).map_err(store_err)?,
+                    next.id,
+                    i64::try_from(record.version).map_err(store_err)?
+                ],
+            )
+            .map_err(store_err)?;
+        if changed != 1 {
+            return Err(Error::Conflict(record.id));
+        }
+        tx.execute("INSERT INTO legacy_recoveries(job,previous_version,manifest,report) VALUES (?1,?2,?3,?4)",rusqlite::params![record.id,i64::try_from(record.version).map_err(store_err)?,serde_json::to_string(manifest).map_err(store_err)?,serde_json::to_string(&report).map_err(store_err)?]).map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(report)
+    }
+
     fn reserve(&self, signer: &str, job: &str, version: Option<u64>) -> Result<String> {
         let mut c = self.conn.lock().map_err(store_err)?;
         let tx = c
@@ -437,6 +508,7 @@ impl Store for SqliteStore {
         }
         if previous.buyback_budget != rec.buyback_budget
             || previous.auto_required != rec.auto_required
+            || previous.identity != rec.identity
         {
             return Err(Error::Store("immutable job budget".into()));
         }

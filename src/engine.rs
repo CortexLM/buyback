@@ -161,6 +161,7 @@ impl<C: EngineRpc> Engine<C> {
             buyback: None,
             buyback_budget: self.cfg.buyback_budget.clone(),
             auto_required: Some(self.cfg.buyback_budget.is_some()),
+            identity: Some(self.job_identity()),
             attempts: 0,
             next_attempt_at: 0,
             last_error: None,
@@ -245,6 +246,7 @@ impl<C: EngineRpc> Engine<C> {
             buyback: None,
             buyback_budget: self.cfg.buyback_budget.clone(),
             auto_required: Some(self.cfg.buyback_budget.is_some()),
+            identity: Some(self.job_identity()),
             attempts: 0,
             next_attempt_at: 0,
             last_error: None,
@@ -375,12 +377,27 @@ impl<C: EngineRpc> Engine<C> {
         Ok(n)
     }
 
+    fn job_identity(&self) -> crate::state::JobIdentity {
+        crate::state::JobIdentity {
+            genesis_hash: self.chain.genesis_hash(),
+            treasury: keys::ss58(&self.treasury_account()),
+            treasury_hotkey: keys::ss58(&self.cfg.treasury_hotkey),
+            consolidate: self.cfg.consolidate,
+            return_dust: self.cfg.return_dust,
+        }
+    }
+
     /// Advance one payment by at most one chain action. Returns whether anything changed.
     async fn step(
         &self,
         mut r: PaymentRecord,
         positions: &std::collections::BTreeMap<AccountId32, Vec<crate::chain::StakePosition>>,
     ) -> Result<bool> {
+        if r.identity.as_ref() != Some(&self.job_identity()) {
+            return Err(Error::Config(
+                "job execution identity missing or mismatched".into(),
+            ));
+        }
         if r.quarantined.is_some() {
             return Ok(false);
         }
@@ -910,6 +927,7 @@ fn action_name(a: &Action) -> &'static str {
 /// Engine transport, injectable for offline state-machine tests.
 #[async_trait::async_trait]
 pub trait EngineRpc: TransactionRpc {
+    fn genesis_hash(&self) -> String;
     async fn free_balance(&self, who: &AccountId32) -> Result<u64>;
     async fn account(&self, who: &AccountId32) -> Result<(u64, u32)>;
     async fn alpha_on(
@@ -938,6 +956,9 @@ pub trait EngineRpc: TransactionRpc {
 }
 #[async_trait::async_trait]
 impl EngineRpc for Chain {
+    fn genesis_hash(&self) -> String {
+        Chain::genesis_hash(self)
+    }
     async fn free_balance(&self, who: &AccountId32) -> Result<u64> {
         Chain::free_balance(self, who).await
     }
@@ -1648,6 +1669,9 @@ mod journal_rpc_tests {
     }
     #[async_trait::async_trait]
     impl EngineRpc for Arc<SimulatedChain> {
+        fn genesis_hash(&self) -> String {
+            "simulated-genesis".into()
+        }
         async fn free_balance(&self, _: &AccountId32) -> Result<u64> {
             Ok(1_000_000_000)
         }
@@ -1759,6 +1783,44 @@ mod journal_rpc_tests {
     }
 
     #[tokio::test]
+    async fn identity_is_persisted_and_mismatch_never_broadcasts() {
+        let treasury = PaymentWallet::generate().unwrap();
+        let rpc = Arc::new(SimulatedChain {
+            broadcasts: AtomicUsize::new(0),
+            hotkey: treasury.account_id(),
+            owner: Some(treasury.account_id()),
+            result: std::sync::Mutex::new(EventSummary::default()),
+        });
+        let store = Arc::new(SqliteStore::in_memory().unwrap());
+        let cfg = Config::new("unused", 100, treasury.account_id());
+        let engine = Engine::new(
+            rpc.clone(),
+            store.clone(),
+            MasterKey::from_bytes([42; 32]),
+            treasury.keypair().clone(),
+            cfg,
+        );
+        let request = engine
+            .create_payment(CreatePayment::default())
+            .await
+            .unwrap();
+        let record = store.get(&request.id).await.unwrap().unwrap();
+        assert_eq!(record.identity.as_ref(), Some(&engine.job_identity()));
+        for field in 0..4 {
+            let mut bad = record.clone();
+            match field {
+                0 => bad.identity = None,
+                1 => bad.identity.as_mut().unwrap().genesis_hash = "other".into(),
+                2 => bad.identity.as_mut().unwrap().treasury = "other".into(),
+                _ => bad.identity.as_mut().unwrap().treasury_hotkey = "other".into(),
+            }
+            assert!(store.update(&bad).await.is_err());
+            assert!(engine.step(bad, &Default::default()).await.is_err());
+        }
+        assert_eq!(rpc.broadcasts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn engine_ticks_complete_after_each_lost_response_and_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("engine.db");
@@ -1766,6 +1828,13 @@ mod journal_rpc_tests {
         let treasury = PaymentWallet::generate().unwrap();
         let keyring: Keyring = MasterKey::from_bytes([42; 32]).into();
         let mut rec = crate::state::test_record("engine");
+        rec.identity = Some(crate::state::JobIdentity {
+            genesis_hash: "simulated-genesis".into(),
+            treasury: keys::ss58(&treasury.account_id()),
+            treasury_hotkey: keys::ss58(&treasury.account_id()),
+            consolidate: false,
+            return_dust: false,
+        });
         rec.netuid = 100;
         rec.auto_required = Some(true);
         rec.address = keys::ss58(&wallet.account_id());

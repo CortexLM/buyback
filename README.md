@@ -378,12 +378,35 @@ capital source/allocation or destruction policy; mutable runtime defaults cannot
 that intent. Records also lack a genesis hash, and receipts alone cannot establish that
 no additional pre-journal action was emitted before a crash.
 
-Recovery therefore requires an audited operator manifest identifying network, signers,
-intended budget and steps, plus complete finalized extrinsics/events covering execution
-and any uncertain interval. An eventual importer must first dry-run hash, signer, nonce,
-target, amount and step checks, then apply a version-checked update without emitting any
-transaction or deleting evidence. No such importer exists here. Missing evidence means
-refusal, not automatic policy assignment, release or retry.
+`buyback recover-legacy --manifest manifest.json --database jobs.sqlite --archive
+wss://trusted-archive` performs a read-only dry run. Add `--apply` only during offline
+operator maintenance. No signing keys are loaded. The `recovery::LegacyManifest`
+requires genesis, treasury, treasury hotkey, explicit consolidation/dust settings,
+budget (including explicit null for no buyback), exact extrinsics with block/index,
+signer/nonce, receipts and full `ChainCall` parameters. New jobs freeze those identity
+and configuration fields; a mismatched or missing identity blocks processing, including
+pending reconciliation. The older budget-only migration does not establish identity.
+
+An operator must attest that ALL old emitters stopped, that `first_block` covers ALL
+old emissions, and the historical maximum mortal-signature lifetime. Record the evidence
+reference in `operator_attestation`. Unknown mortality or unpublished immortal signatures
+preclude recovery. Never infer historical mortality from today's defaults. The archive
+is a trusted RPC source, not a light-client finality proof; operator attestations cannot
+be proven from on-chain data. This trust assumption is mandatory and residual.
+
+The importer scans both signers through a finalized anchor beyond that lifetime,
+compares every signed call/hash/nonce and its successful events, then reproduces stored
+accounting. Any unrelated signer activity, archive gap, missing receipt, unresolved
+reservation, journal or quarantine refuses import. Only pristine jobs and completely
+explained Funded/Swept prefixes (including Failed at those stages) are supported.
+Conservative replay may reject valid histories with skipped consolidation or dust steps.
+It never reconstructs missing receipts or clears orphan reservations.
+
+Apply holds an SQLite write transaction through a fresh archive scan, checks the version,
+and commits policy/identity plus the full manifest and finalized anchor in
+`legacy_recoveries` atomically. Cancellation/error rolls back; repeated import refuses.
+State, receipts and sealed keys remain intact; failed jobs still require explicit retry.
+Missing evidence means refusal, not automatic policy assignment, release or retry.
 
 
 SQLite reserves each signer exclusively before preparing a transaction. Reservation

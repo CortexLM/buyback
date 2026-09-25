@@ -64,3 +64,4 @@ jobs:
           echo "localnet did not start"; exit 1
       - run: cargo run --example verify_metadata -- local
       - run: cargo test --all-features --test localnet -- --nocapture
+      - run: cargo test --all-features --lib archive_dry_run_apply_and_repeated_import -- --nocapture
